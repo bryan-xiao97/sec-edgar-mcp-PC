@@ -27,6 +27,7 @@ from edgar.ai.mcp.tools.continuation import (
     TEXT_PAGE_CHARS,
     CursorError,
     ResultCache,
+    canonical_accession,
     check_fingerprint,
     decode_cursor,
     encode_cursor,
@@ -34,6 +35,7 @@ from edgar.ai.mcp.tools.continuation import (
     paginate,
     paginate_text,
     peek_cursor_accession,
+    resolve_cursor_accession,
 )
 
 
@@ -175,6 +177,68 @@ def test_peek_cursor_accession_empty_raises_invalid_cursor():
     with pytest.raises(CursorError) as exc_info:
         peek_cursor_accession("")
     assert exc_info.value.error_code == "INVALID_CURSOR"
+
+
+# =============================================================================
+# canonical_accession / resolve_cursor_accession -- cursor-only continuation
+# (constraints rule 7b), shared by edgar_notes/edgar_read (bdc/paging.py's
+# peek_bdc_cursor uses canonical_accession too, for edgar_fund)
+# =============================================================================
+
+@pytest.mark.fast
+def test_canonical_accession_strips_whitespace():
+    assert canonical_accession("  0001628280-26-050307  ") == "0001628280-26-050307"
+
+
+@pytest.mark.fast
+def test_canonical_accession_rewrites_18_digit_form():
+    assert canonical_accession("000162828026050307") == "0001628280-26-050307"
+
+
+@pytest.mark.fast
+def test_canonical_accession_leaves_non_18_digit_strings_alone():
+    assert canonical_accession("0001628280-26-050307") == "0001628280-26-050307"
+    assert canonical_accession("not-an-accession") == "not-an-accession"
+
+
+@pytest.mark.fast
+def test_resolve_cursor_accession_passes_through_without_a_cursor():
+    accession, err = resolve_cursor_accession(None, "0001628280-26-050307")
+    assert err is None
+    assert accession == "0001628280-26-050307"
+
+
+@pytest.mark.fast
+def test_resolve_cursor_accession_uses_the_cursors_own_accession_when_omitted():
+    cursor = encode_cursor(tool="edgar_read:section", accession="0001628280-26-050307", offset=20, fp="f" * 12)
+    accession, err = resolve_cursor_accession(cursor, None)
+    assert err is None
+    assert accession == "0001628280-26-050307"
+
+
+@pytest.mark.fast
+def test_resolve_cursor_accession_accepts_a_matching_accession_number():
+    cursor = encode_cursor(tool="edgar_read:section", accession="0001628280-26-050307", offset=20, fp="f" * 12)
+    accession, err = resolve_cursor_accession(cursor, "000162828026050307")  # undashed, same filing
+    assert err is None
+    assert accession == "0001628280-26-050307"
+
+
+@pytest.mark.fast
+def test_resolve_cursor_accession_rejects_a_differing_accession_number():
+    cursor = encode_cursor(tool="edgar_read:section", accession="0001628280-26-050307", offset=20, fp="f" * 12)
+    accession, err = resolve_cursor_accession(cursor, "0000000000-26-000001")
+    assert accession is None
+    assert err is not None
+    assert err.error_code == "CURSOR_MISMATCH"
+
+
+@pytest.mark.fast
+def test_resolve_cursor_accession_undecodable_cursor_is_invalid_cursor():
+    accession, err = resolve_cursor_accession("!!!not-base64-or-json!!!", None)
+    assert accession is None
+    assert err is not None
+    assert err.error_code == "INVALID_CURSOR"
 
 
 # =============================================================================

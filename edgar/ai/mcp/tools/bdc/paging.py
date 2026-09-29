@@ -31,14 +31,6 @@ class PeekedCursor:
     query: Optional[dict]
 
 
-def _canonical_accession(value: str) -> str:
-    """`value` stripped, with an 18-digit form rewritten to NNNNNNNNNN-NN-NNNNNN."""
-    cleaned = value.strip()
-    if len(cleaned) == 18 and cleaned.isdigit():
-        return f"{cleaned[:10]}-{cleaned[10:12]}-{cleaned[12:]}"
-    return cleaned
-
-
 def _cursor_error_response(message: str, error_code: str) -> Any:
     from edgar.ai.mcp.tools.continuation import CursorError
 
@@ -55,7 +47,7 @@ def peek_bdc_cursor(cursor: Optional[str], *, allowed_tools: tuple[str, ...], ac
     (`CURSOR_MISMATCH`). The full identity and fingerprint checks still run
     later against the loaded filing.
     """
-    from edgar.ai.mcp.tools.continuation import CursorError, peek_cursor
+    from edgar.ai.mcp.tools.continuation import CursorError, canonical_accession, peek_cursor
 
     if not cursor:
         return None, None
@@ -71,7 +63,7 @@ def peek_bdc_cursor(cursor: Optional[str], *, allowed_tools: tuple[str, ...], ac
         return None, _cursor_error_response(
             "Cursor was issued for a different tool or action than this call.", "CURSOR_MISMATCH"
         )
-    if accession_number and _canonical_accession(accession_number) != accession:
+    if accession_number and canonical_accession(accession_number) != accession:
         return None, _cursor_error_response(
             "Cursor was issued for a different filing than accession_number.", "CURSOR_MISMATCH"
         )

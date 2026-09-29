@@ -228,6 +228,52 @@ def peek_cursor_accession(cursor: str) -> str:
     return peek_cursor(cursor)["acc"]
 
 
+def canonical_accession(value: str) -> str:
+    """``value`` stripped, with an 18-digit form rewritten to NNNNNNNNNN-NN-NNNNNN.
+
+    Shared by every cursor-only continuation path (constraints rule 7b) that
+    compares a caller-supplied ``accession_number`` against the one a cursor
+    already names, so a caller does not have to match the cursor's exact
+    dashed/undashed spelling.
+    """
+    cleaned = value.strip()
+    if len(cleaned) == 18 and cleaned.isdigit():
+        return f"{cleaned[:10]}-{cleaned[10:12]}-{cleaned[12:]}"
+    return cleaned
+
+
+def resolve_cursor_accession(cursor: Optional[str], accession_number: Optional[str]):
+    """The accession to select with, given an optional cursor (rule 7b).
+
+    Cursor-only continuation: a cursor alone names its own filing by
+    accession, so a caller does not have to re-supply ``accession_number``
+    (or ``period``, which the caller should independently drop) just to
+    continue paging. Returns ``(accession_or_None, error_response_or_None)``:
+
+    - No ``cursor``: ``(accession_number, None)``, unchanged.
+    - A ``cursor``, no ``accession_number``: the cursor's own accession.
+    - A ``cursor`` AND an ``accession_number`` naming a different filing
+      (after canonicalizing the 18-digit form): ``(None, CURSOR_MISMATCH
+      response)``.
+    - An undecodable ``cursor``: ``(None, INVALID_CURSOR response)``.
+
+    Used directly by edgar_notes/edgar_read; ``edgar_fund``'s BDC actions
+    use the same rule through ``bdc/paging.py``'s ``peek_bdc_cursor``, which
+    additionally restricts which tools' cursors it accepts.
+    """
+    if not cursor:
+        return accession_number, None
+    try:
+        cursor_accession = peek_cursor_accession(cursor)
+    except CursorError as exc:
+        return None, exc.to_response()
+    if accession_number and canonical_accession(accession_number) != canonical_accession(cursor_accession):
+        return None, _cursor_error(
+            "CURSOR_MISMATCH", "Cursor was issued for a different filing than accession_number."
+        ).to_response()
+    return cursor_accession, None
+
+
 def decode_cursor(
     cursor: str,
     *,

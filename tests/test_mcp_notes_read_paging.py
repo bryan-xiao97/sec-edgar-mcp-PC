@@ -146,9 +146,74 @@ def _patch_notes_selection(monkeypatch, filing):
     )
 
 
+def _patch_selection_by_accession(monkeypatch, filings, latest=None, valid_identifier="PFX"):
+    """A resolver fake that honours the accession path the way the real one
+    does (constraints rule 7b / P1-H2): selects by `accession_number` when
+    given, raising SELECTION_MISMATCH for any OTHER identifier (simulating
+    the real CIK cross-check); by exact `period`; else `latest`. Records
+    every call's kwargs. Shared by the notes and read cursor-only tests
+    below; mirrors `_patch_selection_by_accession` in
+    tests/test_mcp_bdc_portfolio.py."""
+    from edgar.ai.mcp.tools.selection import FilingSelectionError
+
+    by_acc = {f.accession_number: f for f in filings}
+    calls = []
+
+    def _resolve(**kwargs):
+        calls.append(kwargs)
+        acc = kwargs.get("accession_number")
+        if acc:
+            filing = by_acc.get(acc)
+            if filing is None:
+                raise FilingSelectionError("not found", error_code="FILING_NOT_FOUND")
+            identifier = kwargs.get("identifier")
+            if identifier is not None and identifier != valid_identifier:
+                raise FilingSelectionError("mismatch", error_code="SELECTION_MISMATCH")
+            return FilingSelection(filing=filing, selected_by="accession")
+        if kwargs.get("period"):
+            match = next((f for f in filings if f.report_date == kwargs["period"]), None)
+            if match is None:
+                raise FilingSelectionError("not found", error_code="PERIOD_NOT_FOUND")
+            return FilingSelection(filing=match, selected_by="period")
+        return FilingSelection(filing=latest or filings[0], selected_by="latest")
+
+    monkeypatch.setattr("edgar.ai.mcp.tools.selection.resolve_report_filing", _resolve)
+    return calls
+
+
+def _holds_xbrl(value, _seen=None) -> bool:
+    """True if `value` -- or anything reachable by walking it (dict values,
+    or any other iterable's elements, e.g. a Notes container) -- has an
+    `_xbrl` attribute (P2-M4: that is exactly what pins the parsed XBRL
+    model, e.g. `edgar.xbrl.notes.Note._xbrl`)."""
+    if _seen is None:
+        _seen = set()
+    if id(value) in _seen:
+        return False
+    _seen.add(id(value))
+    if hasattr(value, "_xbrl"):
+        return True
+    if isinstance(value, dict):
+        return any(_holds_xbrl(v, _seen) for v in value.values())
+    if isinstance(value, (str, bytes)) or value is None:
+        return False
+    try:
+        iterator = iter(value)
+    except TypeError:
+        return False
+    return any(_holds_xbrl(v, _seen) for v in iterator)
+
+
 @pytest.fixture(autouse=True)
-def _isolated_results_cache(monkeypatch):
+def _isolated_caches(monkeypatch):
+    # text_cache is isolated too (not just results_cache): several notes
+    # tests below reuse the SAME default accession number across different
+    # fake filings, and notes.py now stores per-table/context evidence in
+    # the shared, module-level text_cache (P2-M4) -- without this, one
+    # test's cached rows could leak into another test that decodes a
+    # cursor for the "same" accession/note/table but different content.
     monkeypatch.setattr(continuation, "results_cache", ResultCache(max_entries=8))
+    monkeypatch.setattr(continuation, "text_cache", ResultCache(max_entries=64, max_bytes=32 * 1024 * 1024))
 
 
 # =============================================================================
@@ -247,7 +312,10 @@ class TestNotesTablePaging:
         filing2 = _FakeNotesFiling(_FakeReportObj(_FakeNotes([other_note])), accession_number=filing.accession_number)
         _patch_notes_selection(monkeypatch, filing2)
         # Re-extract after eviction so this test still covers a missing note.
-        monkeypatch.setattr(continuation, "results_cache", ResultCache(max_entries=8))
+        # (P2-M4: notes.py caches per-table/context evidence in text_cache,
+        # not the whole Notes/report object in results_cache -- clearing
+        # results_cache alone would not force a reparse here.)
+        monkeypatch.setattr(continuation, "text_cache", ResultCache(max_entries=64, max_bytes=32 * 1024 * 1024))
 
         result = await edgar_notes(identifier="PFX", topic="debt", cursor=cursor)
         assert result.success is False
@@ -386,6 +454,169 @@ class TestNotesArgumentsAndSource:
 
 
 # =============================================================================
+# edgar_notes: cursor-only continuation (P1-H2 / constraints rule 7b)
+# =============================================================================
+
+@pytest.mark.fast
+@pytest.mark.asyncio
+class TestNotesCursorOnlyContinuation:
+    """A cursor alone is enough; a supplied topic/detail/accession_number/
+    identifier must agree with the cursor."""
+
+    async def test_cursor_alone_walks_all_table_rows(self, monkeypatch):
+        df = pd.DataFrame({"principal": [1, 2, 3, 4, 5]})
+        table = _FakeTable("Schedule of Debt", df)
+        note = _FakeNote(1, "Debt", tables=[table])
+        filing = _FakeNotesFiling(_FakeReportObj(_FakeNotes([note])))
+        _patch_selection_by_accession(monkeypatch, [filing])
+
+        first = await edgar_notes(identifier="PFX", topic="debt", detail="full", limit=2)
+        assert first.success is True
+        collected = [row["principal"] for row in first.data["notes"][0]["tables"][0]["data"]]
+        cursor = first.data["notes"][0]["tables"][0]["next_cursor"]
+        assert cursor is not None
+
+        pages = 0
+        while cursor:
+            page = await edgar_notes(cursor=cursor)
+            assert page.success is True, page.error
+            assert page.data["note"] == {"number": 1, "title": "Debt"}
+            collected.extend(row["principal"] for row in page.data["table"])
+            cursor = page.data["page"]["next_cursor"]
+            pages += 1
+            assert pages < 10
+
+        assert collected == [1, 2, 3, 4, 5]
+
+    async def test_cursor_alone_walks_context_text(self, monkeypatch):
+        big_text = ("A" * 6500) + "\n\n" + ("B" * 3500)
+        note = _FakeNote(2, "Revenue Recognition", context_text=big_text)
+        filing = _FakeNotesFiling(_FakeReportObj(_FakeNotes([note])))
+        _patch_selection_by_accession(monkeypatch, [filing])
+
+        first = await edgar_notes(identifier="PFX", topic="revenue", detail="standard")
+        assert first.success is True
+        cursor = first.data["notes"][0]["context_page"]["next_cursor"]
+        assert cursor is not None
+        collected = first.data["notes"][0]["context"]
+
+        page = await edgar_notes(cursor=cursor)
+        assert page.success is True, page.error
+        collected += page.data["context"]
+        assert page.data["page"]["next_cursor"] is None
+        assert collected == big_text
+
+    async def test_supplied_topic_matching_cursor_is_accepted(self, monkeypatch):
+        df = pd.DataFrame({"principal": [1, 2, 3]})
+        table = _FakeTable("Schedule of Debt", df)
+        note = _FakeNote(1, "Debt", tables=[table])
+        filing = _FakeNotesFiling(_FakeReportObj(_FakeNotes([note])))
+        _patch_selection_by_accession(monkeypatch, [filing])
+
+        first = await edgar_notes(identifier="PFX", topic="debt", detail="full", limit=1)
+        cursor = first.data["notes"][0]["tables"][0]["next_cursor"]
+
+        page = await edgar_notes(topic="debt", cursor=cursor)
+        assert page.success is True, page.error
+
+    async def test_supplied_topic_differing_from_cursor_is_cursor_mismatch(self, monkeypatch):
+        df = pd.DataFrame({"principal": [1, 2, 3]})
+        table = _FakeTable("Schedule of Debt", df)
+        note = _FakeNote(1, "Debt", tables=[table])
+        filing = _FakeNotesFiling(_FakeReportObj(_FakeNotes([note])))
+        _patch_selection_by_accession(monkeypatch, [filing])
+
+        first = await edgar_notes(identifier="PFX", topic="debt", detail="full", limit=1)
+        cursor = first.data["notes"][0]["tables"][0]["next_cursor"]
+
+        page = await edgar_notes(topic="revenue", cursor=cursor)
+        assert page.success is False
+        assert page.error_code == "CURSOR_MISMATCH"
+
+    async def test_supplied_detail_differing_from_cursor_context_is_cursor_mismatch(self, monkeypatch):
+        big_text = ("A" * 6500) + "\n\n" + ("B" * 3500)
+        note = _FakeNote(2, "Revenue Recognition", context_text=big_text)
+        filing = _FakeNotesFiling(_FakeReportObj(_FakeNotes([note])))
+        _patch_selection_by_accession(monkeypatch, [filing])
+
+        first = await edgar_notes(identifier="PFX", topic="revenue", detail="standard")
+        cursor = first.data["notes"][0]["context_page"]["next_cursor"]
+
+        page = await edgar_notes(detail="full", cursor=cursor)
+        assert page.success is False
+        assert page.error_code == "CURSOR_MISMATCH"
+
+    async def test_identifier_for_a_different_company_is_selection_mismatch(self, monkeypatch):
+        df = pd.DataFrame({"principal": [1, 2, 3]})
+        table = _FakeTable("Schedule of Debt", df)
+        note = _FakeNote(1, "Debt", tables=[table])
+        filing = _FakeNotesFiling(_FakeReportObj(_FakeNotes([note])))
+        _patch_selection_by_accession(monkeypatch, [filing])
+
+        first = await edgar_notes(identifier="PFX", topic="debt", detail="full", limit=1)
+        cursor = first.data["notes"][0]["tables"][0]["next_cursor"]
+
+        page = await edgar_notes(identifier="OTHER", cursor=cursor)
+        assert page.success is False
+        assert page.error_code == "SELECTION_MISMATCH"
+
+    async def test_accession_number_differing_from_cursor_is_cursor_mismatch(self, monkeypatch):
+        df = pd.DataFrame({"principal": [1, 2, 3]})
+        table = _FakeTable("Schedule of Debt", df)
+        note = _FakeNote(1, "Debt", tables=[table])
+        filing = _FakeNotesFiling(_FakeReportObj(_FakeNotes([note])))
+        calls = _patch_selection_by_accession(monkeypatch, [filing])
+
+        first = await edgar_notes(identifier="PFX", topic="debt", detail="full", limit=1)
+        cursor = first.data["notes"][0]["tables"][0]["next_cursor"]
+        calls.clear()
+
+        page = await edgar_notes(accession_number="0000000000-26-000001", cursor=cursor)
+        assert page.success is False
+        assert page.error_code == "CURSOR_MISMATCH"
+        assert calls == []  # rejected before any filing selection
+
+    async def test_garbage_cursor_alone_is_invalid_cursor(self, monkeypatch):
+        """Silence check: a cursor-only call with a garbage cursor names the
+        cursor as the problem, not a missing identifier."""
+        filing = _FakeNotesFiling(_FakeReportObj(_FakeNotes([_FakeNote(1, "Debt")])))
+        calls = _patch_selection_by_accession(monkeypatch, [filing])
+
+        result = await edgar_notes(cursor="!!!not-a-real-cursor!!!")
+        assert result.success is False
+        assert result.error_code == "INVALID_CURSOR"
+        assert calls == []
+
+
+# =============================================================================
+# edgar_notes: bounded cache never retains parsed XBRL (P2-M4)
+# =============================================================================
+
+@pytest.mark.fast
+@pytest.mark.asyncio
+class TestNotesCacheNeverRetainsXbrl:
+    async def test_cached_entries_hold_no_object_with_xbrl_attribute(self, monkeypatch):
+        """The notes cache must never retain an object with an `_xbrl`
+        attribute -- that is exactly what pinned the whole parsed XBRL
+        model (~6.4 MB for Princeton) in the shared, unbounded
+        results_cache before this fix."""
+        df = pd.DataFrame({"principal": [1, 2, 3]})
+        table = _FakeTable("Schedule of Debt", df)
+        note = _FakeNote(1, "Debt", tables=[table], context_text="A" * 7000)
+        note._xbrl = object()  # simulates edgar.xbrl.notes.Note._xbrl
+        filing = _FakeNotesFiling(_FakeReportObj(_FakeNotes([note])))
+        _patch_notes_selection(monkeypatch, filing)
+
+        result = await edgar_notes(identifier="PFX", topic="debt", detail="full", limit=1)
+        assert result.success is True
+
+        for cache in (continuation.results_cache, continuation.text_cache):
+            for key in list(cache._data.keys()):
+                value = cache.get(key)
+                assert not _holds_xbrl(value), f"cache entry {key!r} retains an object with _xbrl"
+
+
+# =============================================================================
 # Fakes -- edgar_read
 # =============================================================================
 
@@ -518,6 +749,112 @@ class TestReadCursorArguments:
 
 
 # =============================================================================
+# edgar_read: cursor-only continuation (P1-H2 / constraints rule 7b)
+# =============================================================================
+
+@pytest.mark.fast
+@pytest.mark.asyncio
+class TestReadCursorOnlyContinuation:
+    """A cursor alone is enough; a supplied sections/accession_number/
+    identifier must agree with the cursor."""
+
+    async def test_cursor_alone_continues_the_chosen_section(self, monkeypatch):
+        text = ("P" * 6500) + "\n\n" + ("Q" * 3000)
+        filing = _FakeReadFiling(accession_number="0002222222-26-000001")
+        _patch_selection_by_accession(monkeypatch, [filing])
+        monkeypatch.setattr(reader_module, "_extract_section", lambda obj, form, section: text)
+
+        first = await edgar_read(identifier="PFX", form="10-Q", sections=["mda"])
+        assert first.success is True
+        cursor = first.data["section_pages"]["mda"]["next_cursor"]
+        assert cursor is not None
+        collected = first.data["sections"]["mda"]
+
+        page = await edgar_read(cursor=cursor)
+        assert page.success is True, page.error
+        assert page.data["source"]["accession_number"] == filing.accession_number
+        assert set(page.data["sections"].keys()) == {"mda"}
+        collected += page.data["sections"]["mda"]
+        assert page.data["section_pages"]["mda"]["next_cursor"] is None
+        assert collected == text
+
+    async def test_supplied_matching_section_is_accepted(self, monkeypatch):
+        text = "X" * 7000
+        filing = _FakeReadFiling(accession_number="0002222222-26-000002")
+        _patch_selection_by_accession(monkeypatch, [filing])
+        monkeypatch.setattr(reader_module, "_extract_section", lambda obj, form, section: text)
+
+        first = await edgar_read(identifier="PFX", form="10-Q", sections=["mda"])
+        cursor = first.data["section_pages"]["mda"]["next_cursor"]
+
+        page = await edgar_read(sections=["mda"], cursor=cursor)
+        assert page.success is True, page.error
+
+    async def test_a_different_section_with_the_cursor_is_cursor_mismatch(self, monkeypatch):
+        text = "X" * 7000
+        filing = _FakeReadFiling(accession_number="0002222222-26-000003")
+        _patch_selection_by_accession(monkeypatch, [filing])
+        monkeypatch.setattr(reader_module, "_extract_section", lambda obj, form, section: text)
+
+        first = await edgar_read(identifier="PFX", form="10-Q", sections=["mda"])
+        cursor = first.data["section_pages"]["mda"]["next_cursor"]
+
+        page = await edgar_read(sections=["risk_factors"], cursor=cursor)
+        assert page.success is False
+        assert page.error_code == "CURSOR_MISMATCH"
+
+    async def test_identifier_for_a_different_company_is_selection_mismatch(self, monkeypatch):
+        text = "X" * 7000
+        filing = _FakeReadFiling(accession_number="0002222222-26-000004")
+        _patch_selection_by_accession(monkeypatch, [filing])
+        monkeypatch.setattr(reader_module, "_extract_section", lambda obj, form, section: text)
+
+        first = await edgar_read(identifier="PFX", form="10-Q", sections=["mda"])
+        cursor = first.data["section_pages"]["mda"]["next_cursor"]
+
+        page = await edgar_read(identifier="OTHER", cursor=cursor)
+        assert page.success is False
+        assert page.error_code == "SELECTION_MISMATCH"
+
+    async def test_accession_number_differing_from_cursor_is_cursor_mismatch(self, monkeypatch):
+        text = "X" * 7000
+        filing = _FakeReadFiling(accession_number="0002222222-26-000005")
+        calls = _patch_selection_by_accession(monkeypatch, [filing])
+        monkeypatch.setattr(reader_module, "_extract_section", lambda obj, form, section: text)
+
+        first = await edgar_read(identifier="PFX", form="10-Q", sections=["mda"])
+        cursor = first.data["section_pages"]["mda"]["next_cursor"]
+        calls.clear()
+
+        page = await edgar_read(accession_number="0000000000-26-000001", cursor=cursor)
+        assert page.success is False
+        assert page.error_code == "CURSOR_MISMATCH"
+        assert calls == []  # rejected before any filing selection
+
+    async def test_another_tools_cursor_is_rejected_before_any_selection(self, monkeypatch):
+        calls = _patch_selection_by_accession(monkeypatch, [_FakeReadFiling(accession_number="0002222222-26-000006")])
+        foreign_cursor = continuation.encode_cursor(
+            tool="edgar_notes:table", accession="0002222222-26-000006", offset=20, fp="abc", query=None,
+        )
+
+        result = await edgar_read(cursor=foreign_cursor)
+
+        assert result.success is False
+        assert result.error_code == "CURSOR_MISMATCH"
+        assert calls == []
+
+    async def test_garbage_cursor_alone_is_invalid_cursor(self, monkeypatch):
+        """Silence check: a cursor-only call with a garbage cursor names the
+        cursor as the problem, not a missing identifier/form."""
+        calls = _patch_selection_by_accession(monkeypatch, [_FakeReadFiling()])
+
+        result = await edgar_read(cursor="!!!not-a-real-cursor!!!")
+        assert result.success is False
+        assert result.error_code == "INVALID_CURSOR"
+        assert calls == []
+
+
+# =============================================================================
 # edgar_read: raw_text_preview fallback flagged
 # =============================================================================
 
@@ -624,6 +961,38 @@ class TestEdgarReadARCCLive:
                 identifier="ARCC", form="10-Q", period=ARCC_10Q_PERIOD, sections=["mda"], cursor=cursor
             )
             assert page.success is True, page.error
+            collected += page.data["sections"]["mda"]
+            cursor = page.data["section_pages"]["mda"]["next_cursor"]
+
+        assert len(collected) == total_chars
+
+    async def test_walking_all_pages_with_the_cursor_alone(self):
+        """P1-H2 / rule 7b, against the real ~88 MB submission: after page
+        1, every later call sends only `cursor` -- no identifier, form,
+        period, or sections -- and still reassembles the exact same total
+        length the repeat-args walk above gets."""
+        from edgar import set_identity
+
+        set_identity("Test User test@test.com")
+        first = await edgar_read(
+            identifier="ARCC", form="10-Q", period=ARCC_10Q_PERIOD, sections=["mda"]
+        )
+        assert first.success is True, first.error
+        assert first.data["source"]["accession_number"] == ARCC_10Q_ACCESSION
+
+        page_block = first.data["section_pages"]["mda"]
+        total_chars = page_block["total_chars"]
+        collected = first.data["sections"]["mda"]
+        cursor = page_block["next_cursor"]
+        assert cursor is not None
+
+        seen_cursors = set()
+        while cursor:
+            assert cursor not in seen_cursors
+            seen_cursors.add(cursor)
+            page = await edgar_read(cursor=cursor)
+            assert page.success is True, page.error
+            assert page.data["source"]["accession_number"] == ARCC_10Q_ACCESSION
             collected += page.data["sections"]["mda"]
             cursor = page.data["section_pages"]["mda"]["next_cursor"]
 

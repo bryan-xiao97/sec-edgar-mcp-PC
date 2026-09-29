@@ -16,7 +16,12 @@ Every response carries a ``source`` provenance block.
 Each extracted section is capped at one ``TEXT_PAGE_CHARS`` page; the full
 section text is cached (``text_cache``, keyed by accession + section) so a
 ``cursor`` from a section's ``next_cursor`` can page through the rest without
-re-extracting. A cursor call must name exactly the one section it continues.
+re-extracting. A cursor ALONE is enough to continue (constraints rule 7b):
+it names its own filing (by accession) and section, so ``identifier``/
+``accession_number``/``form``/``period``/``sections`` do not have to be
+re-supplied. Supplying one anyway is fine as long as it agrees with the
+cursor -- a differing ``accession_number`` or ``sections`` value is
+``CURSOR_MISMATCH``; a differing ``identifier`` is ``SELECTION_MISMATCH``.
 """
 
 from __future__ import annotations
@@ -112,6 +117,7 @@ Examples:
 - Read CEO pay: identifier="AAPL", form="DEF 14A", sections=["compensation"]
 - Read from a chosen period: identifier="ARCC", form="10-Q", period="2026-06-30", sections=["mda"]
 - Continue a truncated section: identifier="ARCC", form="10-Q", period="2026-06-30", sections=["mda"], cursor="<section_pages.mda.next_cursor>"
+- Continue with the cursor alone (identifier/form/period/sections are optional and default to the cursor's own values): cursor="<section_pages.mda.next_cursor>"
 
 <!-- MCP_TOOL_CALL_EXAMPLE -->
 ```json
@@ -147,14 +153,20 @@ Examples:
                 "type": "string",
             },
             "description": "Sections to extract. Use 'summary' for metadata only, 'all' for everything. "
-                           "Available sections depend on form type. With a cursor, must contain exactly "
-                           "the one section being continued.",
+                           "Available sections depend on form type. With a cursor, omit to continue "
+                           "that cursor's own section, or pass exactly that one section name -- any "
+                           "other single section is CURSOR_MISMATCH, and more than one is "
+                           "INVALID_ARGUMENTS.",
             "default": ["summary"]
         },
         "cursor": {
             "type": "string",
             "description": "Continuation cursor from a previous response's section_pages.<section>.next_cursor, "
-                           "to fetch the next page of that one section."
+                           "to fetch the next page of that one section. The cursor ALONE is enough -- "
+                           "it selects its own filing and section. identifier/accession_number/sections, "
+                           "if also given, must agree with the cursor (identifier's CIK; accession_number "
+                           "exactly; sections exactly [that section]), else CURSOR_MISMATCH or "
+                           "SELECTION_MISMATCH. form/period are ignored when a cursor is given."
         }
     },
     required=[]
@@ -170,20 +182,60 @@ async def edgar_read(
     """
     Read SEC filing content.
 
-    Can retrieve by accession number, or by identifier + form (latest
-    original filing, or an exact period).
+    Can retrieve by accession number, by identifier + form (latest original
+    filing, or an exact period), or by a cursor alone (constraints rule
+    7b): the cursor's own accession selects the filing and, when `sections`
+    is omitted, its own section continues.
     """
+    sections_given = sections is not None
     sections = sections or ["summary"]
 
     try:
-        if cursor and (len(sections) != 1 or sections[0] in ("summary", "all")):
+        if cursor and sections_given and (len(sections) != 1 or sections[0] in ("summary", "all")):
             return error(
                 "With a cursor, sections must contain exactly one specific section name.",
                 suggestions=["Pass sections=['mda'] (or the single section this cursor continues)"],
                 error_code="INVALID_ARGUMENTS",
             )
 
-        selected = _select_filing(accession_number, identifier, form, period)
+        cursor_accession = None
+        if cursor:
+            from edgar.ai.mcp.tools.continuation import CursorError, canonical_accession, peek_cursor
+
+            try:
+                raw = peek_cursor(cursor)
+            except CursorError as exc:
+                return exc.to_response()
+
+            cursor_accession = raw.get("acc")
+            if not isinstance(cursor_accession, str) or not cursor_accession:
+                return CursorError(
+                    "Cursor does not name a filing.", error_code="INVALID_CURSOR"
+                ).to_response()
+            if raw.get("tool") != _SECTION_TOOL:
+                return CursorError(
+                    "Cursor was issued for a different tool or action than this call.",
+                    error_code="CURSOR_MISMATCH",
+                ).to_response()
+            if accession_number and canonical_accession(accession_number) != canonical_accession(cursor_accession):
+                return CursorError(
+                    "Cursor was issued for a different filing than accession_number.",
+                    error_code="CURSOR_MISMATCH",
+                ).to_response()
+
+            cursor_section = raw.get("doc")
+            if sections_given:
+                if sections[0] != cursor_section:
+                    return CursorError(
+                        f"Cursor was issued for section {cursor_section!r}, not {sections[0]!r}.",
+                        error_code="CURSOR_MISMATCH",
+                    ).to_response()
+            else:
+                sections = [cursor_section]
+
+        select_accession = cursor_accession if cursor else accession_number
+        select_period = None if cursor else period
+        selected = _select_filing(select_accession, identifier, form, select_period)
         if isinstance(selected, ToolResponse):
             return selected
         filing = selected.filing
