@@ -244,7 +244,12 @@ patterns:
       Keep the accession and exact document identity through every call. A document
       URL under SEC Archives identifies its accession and filename; it is not fetched
       as an arbitrary URL. An incorporated-by-reference exhibit may require opening
-      an earlier filing. BDC-filed evidence may describe a borrower without including
+      an earlier filing: read the exhibit-index section or use edgar_text_search.
+      Search is honest about coverage: an unreadable document (PDF, image, paper,
+      empty) returns unreadable_reason, and an all-documents search lists skipped
+      attachments in unsearched_documents, so zero matches never covers them.
+      page.next_cursor alone continues a list, search or read.
+      BDC-filed evidence may describe a borrower without including
       that borrower's agreement; report the evidence and its source without asserting
       a legal conclusion.
 

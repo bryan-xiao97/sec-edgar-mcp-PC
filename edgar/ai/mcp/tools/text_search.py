@@ -20,6 +20,9 @@ from edgar.ai.mcp.tools.base import (
 
 logger = logging.getLogger(__name__)
 
+# Per-hit routing steps are capped and deduplicated by accession.
+MAX_ROUTED_HITS = 5
+
 
 @tool(
     name="edgar_text_search",
@@ -29,12 +32,13 @@ Examples:
 - Topic search: query="artificial intelligence"
 - 8-K events: query="cybersecurity incident", forms=["8-K"]
 - Date range: query="supply chain disruption", start_date="2024-01-01"
+- Company-specific: query="tariff impact", forms=["10-K"], identifier="AAPL"
 - For a returned filing, use edgar_document to search an attachment and read around its document-bound locator.
+
 <!-- MCP_TOOL_CALL_EXAMPLE -->
 ```json
 {"tool":"edgar_text_search","arguments":{"query":"loan agreement","forms":["10-Q"],"identifier":"ARCC","limit":20}}
-```
-- Company-specific: query="tariff impact", forms=["10-K"], identifier="AAPL\"""",
+```""",
     params={
         "query": {
             "type": "string",
@@ -109,6 +113,7 @@ async def edgar_text_search(
         # Serialize to MCP response
         results = []
         result_next_steps = []
+        routed: set[str] = set()
         for r in search_result:
             filing_result = {
                 "accession_number": r.accession_number,
@@ -127,6 +132,11 @@ async def edgar_text_search(
                 filing_result["period"] = r.period
             results.append(filing_result)
 
+            # One routing step per filing, and only the first few, so the
+            # generic next steps are not buried under up to 50 hits (P2-L13).
+            if r.accession_number in routed or len(routed) >= MAX_ROUTED_HITS:
+                continue
+            routed.add(r.accession_number)
             if r.document_id:
                 route_args = json.dumps({
                     "action": "read",

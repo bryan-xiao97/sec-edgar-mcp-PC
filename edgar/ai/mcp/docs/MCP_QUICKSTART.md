@@ -435,8 +435,16 @@ Search locators contain `document` and `char_offset`; pass both through
 `around` for a bounded read centered on the match. Reads return at most 6,000
 characters per page. Search is capped at 1,000 candidates per filing and
 2,048 characters per match; regex has a 50 ms per-document timeout. Exhibits
-incorporated by reference may belong to an earlier filing. A BDC filing may
+incorporated by reference may belong to an earlier filing; read the
+exhibit-index section or use `edgar_text_search` to find it. A BDC filing may
 report a portfolio borrower without containing that borrower's own agreement.
+
+Search never reports zero matches for text it could not read: searching an
+unreadable document (PDF, image, paper, empty) returns `unreadable_reason`, and
+an all-documents search lists skipped attachments in `unsearched_documents`.
+`list` hides XBRL files, generated R pages and XBRL viewer files unless
+`include_all` is true. A `cursor` alone continues a list, search or read.
+`source.selected_by` is `"url"` when a URL chose the filing.
 
 <!-- MCP_TOOL_CALL_EXAMPLE -->
 ```json
@@ -455,7 +463,7 @@ report a portfolio borrower without containing that borrower's own agreement.
 
 <!-- MCP_TOOL_CALL_EXAMPLE -->
 ```json
-{"tool":"edgar_document","arguments":{"action":"read","url":"https://www.sec.gov/Archives/edgar/data/320193/000032019325000073/a10-qexhibit32103292025.htm"}}
+{"tool":"edgar_document","arguments":{"action":"read","url":"https://www.sec.gov/Archives/edgar/data/320193/000032019325000073/a10-qexhibit32106282025.htm"}}
 ```
 
 ## Environment Variables

@@ -14,6 +14,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import List, Optional
+
+from edgar.exceptions import ValidationError
 from edgar.richtools import repr_rich
 
 
@@ -171,6 +173,10 @@ def _grep_text(
     Always case-insensitive (SEC text has inconsistent casing). Optional
     limits return one marked sentinel after the permitted matches or when a
     match span exceeds ``max_match_chars``. Without limits, behavior is unchanged.
+
+    Raises:
+        ValidationError: If ``regex_timeout`` is set and ``pattern`` does not
+            compile. Without a timeout an invalid pattern returns ``[]``.
     """
     if not text or not pattern:
         return []
@@ -193,8 +199,18 @@ def _grep_text(
                 ) from exc
         try:
             compiled = regex_engine.compile(pattern, regex_engine.IGNORECASE)
-        except regex_engine.error:
-            return []
+        except regex_engine.error as exc:
+            if regex_timeout is None:
+                # Historical Filing.grep()/notes.grep() contract: an invalid
+                # pattern finds nothing rather than raising.
+                return []
+            # Timed callers (MCP search) must tell "invalid pattern" apart
+            # from "no matches", so the compile error is surfaced.
+            raise ValidationError(
+                f"Invalid regular expression {pattern!r}: {exc}",
+                parameter="pattern",
+                invalid_value=pattern,
+            ) from exc
 
         regex_matches = (
             compiled.finditer(text)

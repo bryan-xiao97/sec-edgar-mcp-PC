@@ -490,10 +490,12 @@ async def test_search_skips_attachments_without_a_filename(setup_tool):
 async def test_broad_regex_search_is_bounded_across_all_attachments_and_not_cached(
     monkeypatch, setup_tool
 ):
-    from edgar.ai.mcp.tools import document as document_module
+    from edgar.ai.mcp.tools import document_search
     from edgar.ai.mcp.tools.document import edgar_document
 
-    monkeypatch.setattr(document_module, "MAX_SEARCH_MATCHES", 5)
+    # Search lives in document_search (split for the file-size cap), so the
+    # cap and the grep helper are patched where they are looked up.
+    monkeypatch.setattr(document_search, "MAX_SEARCH_MATCHES", 5)
     filing = setup_tool[0]
     filing.attachments.clear()
     filing.attachments.extend(
@@ -503,13 +505,13 @@ async def test_broad_regex_search_is_bounded_across_all_attachments_and_not_cach
         ]
     )
     grep_limits = []
-    original_grep = filing.grep
+    original_grep = document_search._grep_text
 
-    def bounded_grep(pattern, **kwargs):
+    def bounded_grep(text, pattern, location, **kwargs):
         grep_limits.append(kwargs["max_matches"])
-        return original_grep(pattern, **kwargs)
+        return original_grep(text, pattern, location, **kwargs)
 
-    monkeypatch.setattr(filing, "grep", bounded_grep)
+    monkeypatch.setattr(document_search, "_grep_text", bounded_grep)
     result = await edgar_document(
         action="search", accession_number=ACCESSION, query=r"(?s).", regex=True
     )
@@ -736,7 +738,9 @@ async def test_real_paper_attachment_is_listed_unreadable_and_never_searched(mon
     assert read.data["document"]["url"].endswith("submission.paper")
     assert "paper" in read.data["unreadable_reason"].lower()
     assert searched.success is True
-    assert searched.data["matches"] == []
+    # P2-H1: an unreadable document is reported, never searched as "0 matches".
+    assert searched.data["matches"] is None
+    assert "paper" in searched.data["unreadable_reason"].lower()
 
 
 @pytest.mark.fast

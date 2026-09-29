@@ -21,6 +21,7 @@ from edgar.ai.mcp.tools.base import (
     error,
     get_error_suggestions,
 )
+from edgar.ai.mcp.tools.document_identity import is_filing_level_filename, is_hidden_by_default
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,10 @@ def _sec_document_filename(value: Optional[str]) -> Optional[str]:
         return None
     if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename:
         return None
+    # Index pages and the full submission name the filing, not an attachment,
+    # so they get no document hint (QA finding P2-L3).
+    if is_filing_level_filename(filename, parts[5]):
+        return None
     return filename
 
 
@@ -111,6 +116,17 @@ def _document_hint(filing, input_value: Optional[str]) -> Optional[dict[str, Any
     return hint
 
 
+def _hint_hidden(filing, filename: str) -> bool:
+    """Whether edgar_document's default filter hides the hinted attachment."""
+    try:
+        return any(
+            getattr(item, "document", None) == filename and is_hidden_by_default(item)
+            for item in filing.attachments
+        )
+    except Exception:
+        return False
+
+
 @tool(
     name="edgar_filing",
     description="""Use this to examine any SEC filing. Returns structured context: what the filing is, key data, and available next steps. If the filing has a typed data object (10-K, 10-Q, 8-K, Form 4, 13F, DEF 14A, etc.), returns extracted financials, sections, ownership, transactions, etc.
@@ -124,14 +140,14 @@ Examples:
 - Latest 8-K: identifier="TSLA", form="8-K"
 - By accession: input="0000320193-23-000077"
 - From URL: input="https://www.sec.gov/Archives/edgar/data/320193/000032019323000077/..."
+- Minimal overview: identifier="MSFT", form="10-Q", detail="minimal"
 
 Use edgar_read for report sections such as MD&A. Use edgar_document for exact attachments and exhibits.
 
 <!-- MCP_TOOL_CALL_EXAMPLE -->
 ```json
 {"tool":"edgar_filing","arguments":{"input":"0000320193-23-000077","detail":"standard"}}
-```
-- Minimal overview: identifier="MSFT", form="10-Q", detail="minimal\"""",
+```""",
     params={
         "identifier": {
             "type": "string",
@@ -278,11 +294,15 @@ async def edgar_filing(
 
         if document_hint is not None:
             if document_hint["matched"]:
-                document_args = json.dumps({
+                read_args = {
                     "action": "read",
                     "accession_number": filing.accession_no,
                     "document": document_hint["filename"],
-                })
+                }
+                if _hint_hidden(filing, document_hint["filename"]):
+                    # Without it, edgar_document answers DOCUMENT_HIDDEN (P2-L4).
+                    read_args["include_all"] = True
+                document_args = json.dumps(read_args)
                 next_steps.append(
                     f"Use edgar_document with {document_args} to read the exact filing document."
                 )
