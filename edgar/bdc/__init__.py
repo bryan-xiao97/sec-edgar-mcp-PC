@@ -56,6 +56,7 @@ from edgar.bdc.investments import (
     DataQuality,
     PortfolioInvestment,
     PortfolioInvestments,
+    portfolio_investments_from_filing,
 )
 from edgar.bdc.nonaccrual import (
     NonAccrualInvestment,
@@ -71,6 +72,7 @@ from edgar.bdc.reference import (
     get_bdc_list,
     get_latest_bdc_report_year,
     is_bdc_cik,
+    lookup_bdc,
 )
 from edgar.bdc.search import (
     BDCSearchIndex,
@@ -94,10 +96,12 @@ __all__ = [
     'get_bdc_list',
     'get_latest_bdc_report_year',
     'is_bdc_cik',
+    'lookup_bdc',
     # Investments
     'DataQuality',
     'PortfolioInvestment',
     'PortfolioInvestments',
+    'portfolio_investments_from_filing',
     # Non-accrual extraction
     'NonAccrualInvestment',
     'NonAccrualResult',

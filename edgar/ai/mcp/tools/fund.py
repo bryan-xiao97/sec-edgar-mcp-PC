@@ -20,6 +20,9 @@ from edgar.ai.mcp.tools.base import (
     classify_error,
     _cell_missing,
 )
+from edgar.ai.mcp.tools.bdc.identity import bdc_search
+from edgar.ai.mcp.tools.bdc.nonaccrual import bdc_nonaccrual
+from edgar.ai.mcp.tools.bdc.portfolio import bdc_portfolio
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +54,9 @@ def _df_to_records(df: pd.DataFrame, limit: int, columns: Optional[list[str]] = 
 
 @tool(
     name="edgar_fund",
-    description="""Use this for mutual fund, ETF, BDC, and money market fund analysis. Supports fund lookup, portfolio holdings, money market yields, and BDC investments.
+    description="""Use this for mutual fund, ETF, BDC, and money market fund analysis. Supports fund lookup, portfolio holdings, money market yields, BDC investments, and BDC non-accrual evidence.
 
-Actions: lookup (find fund by ticker/CIK), search (by name), portfolio (NPORT holdings), money_market (yields/NAV), bdc_search, bdc_portfolio.
+Actions: lookup (find fund by ticker/CIK), search (by name), portfolio (NPORT holdings), money_market (yields/NAV), bdc_search, bdc_portfolio, bdc_nonaccrual.
 
 Examples:
 - Fund lookup: action="lookup", identifier="VFINX"
@@ -61,17 +64,35 @@ Examples:
 - Fund portfolio: action="portfolio", identifier="VFINX"
 - Money market: action="money_market", identifier="VMFXX"
 - BDC search: action="bdc_search", query="Ares"
-- BDC portfolio: action="bdc_portfolio", identifier="ARCC\"""",
+- BDC portfolio (latest 10-K): action="bdc_portfolio", identifier="ARCC"
+- BDC portfolio (chosen period): action="bdc_portfolio", identifier="ARCC", form="10-Q", period="2026-06-30"
+- BDC portfolio (chosen filing by accession): action="bdc_portfolio", accession_number="0001628280-26-050307"
+- BDC portfolio (borrower filter): action="bdc_portfolio", identifier="ARCC", form="10-Q", period="2026-06-30", borrower="Ivy Hill"
+- BDC portfolio (next page): action="bdc_portfolio", identifier="ARCC", form="10-Q", period="2026-06-30", borrower="Ivy Hill", cursor="<page.next_cursor from the previous call>"
+- BDC portfolio (next page, cursor alone): action="bdc_portfolio", cursor="<page.next_cursor from the previous call>"
+- BDC non-accrual evidence: action="bdc_nonaccrual", identifier="ARCC", form="10-Q", period="2026-06-30"
+
+<!-- MCP_TOOL_CALL_EXAMPLE -->
+```json
+{"tool":"edgar_fund","arguments":{"action":"bdc_portfolio","identifier":"ARCC","form":"10-Q","period":"2026-06-30","borrower":"Ivy Hill","limit":20}}
+```
+
+<!-- MCP_TOOL_CALL_EXAMPLE -->
+```json
+{"tool":"edgar_fund","arguments":{"action":"bdc_portfolio","identifier":"ARCC","form":"10-Q","period":"2026-06-30","borrower":"Ivy Hill","limit":20,"cursor":"<page.next_cursor>"}}
+```""",
     params={
         "action": {
             "type": "string",
             "enum": ["lookup", "search", "portfolio", "money_market",
-                     "bdc_search", "bdc_portfolio"],
+                     "bdc_search", "bdc_portfolio", "bdc_nonaccrual"],
             "description": "The action to perform"
         },
         "identifier": {
             "type": "string",
-            "description": "Fund ticker, series ID (S000XXXXX), class ID (C000XXXXX), or CIK"
+            "description": "Fund ticker, series ID (S000XXXXX), class ID (C000XXXXX), or CIK. "
+                            "BDC actions also accept a BDC name; a name that does not identify "
+                            "exactly one BDC returns AMBIGUOUS_BDC with candidates."
         },
         "query": {
             "type": "string",
@@ -82,6 +103,44 @@ Examples:
             "description": "Max results to return (default 20, max 50)",
             "default": 20
         },
+        "accession_number": {
+            "type": "string",
+            "description": "BDC actions only. Exact SEC accession number (NNNNNNNNNN-NN-NNNNNN) pinning "
+                            "a specific filing. Takes precedence over period. May be given without "
+                            "identifier for action='bdc_portfolio'."
+        },
+        "form": {
+            "type": "string",
+            "enum": ["10-K", "10-Q"],
+            "description": "BDC actions only. Form type to select the filing from (default '10-K').",
+            "default": "10-K"
+        },
+        "period": {
+            "type": "string",
+            "description": "BDC actions only. Reporting period (YYYY-MM-DD) that must exactly match the "
+                            "chosen filing's period_of_report."
+        },
+        "borrower": {
+            "type": "string",
+            "description": "BDC actions only. Case-insensitive substring filter on the portfolio "
+                            "company/borrower name or the raw investment identifier."
+        },
+        "cursor": {
+            "type": "string",
+            "description": "Continuation cursor from a previous bdc_portfolio or bdc_nonaccrual "
+                            "response's page.next_cursor (or the text fallback's "
+                            "text_page.next_cursor), to fetch the next page. The cursor alone is "
+                            "enough: it selects its own filing, borrower and include_untyped. "
+                            "form/period are ignored with a cursor; identifier, accession_number, "
+                            "borrower or include_untyped, if repeated, must match it."
+        },
+        "include_untyped": {
+            "type": "boolean",
+            "description": "BDC actions only. Include investments with an unrecognized/untyped "
+                            "classification (default false). Must be true or false; the strings "
+                            "\"true\"/\"false\" are accepted, anything else is INVALID_ARGUMENTS.",
+            "default": False
+        },
     },
     required=["action"]
 )
@@ -90,6 +149,12 @@ async def edgar_fund(
     identifier: Optional[str] = None,
     query: Optional[str] = None,
     limit: int = 20,
+    accession_number: Optional[str] = None,
+    form: Optional[str] = None,
+    period: Optional[str] = None,
+    borrower: Optional[str] = None,
+    cursor: Optional[str] = None,
+    include_untyped: Optional[Any] = None,
 ) -> Any:
     """Get fund, ETF, BDC, and money market fund data."""
     try:
@@ -139,21 +204,57 @@ async def edgar_fund(
                     suggestions=["Provide a BDC name or ticker, e.g. query='Ares' or query='ARCC'"],
                     error_code="INVALID_ARGUMENTS"
                 )
-            return await _bdc_search(query, limit)
+            return await bdc_search(query, limit)
 
         elif action == "bdc_portfolio":
-            if not identifier:
+            if not identifier and not accession_number and not cursor:
                 return error(
-                    "identifier is required for action='bdc_portfolio'",
-                    suggestions=["Provide a BDC ticker (ARCC) or CIK"],
+                    "identifier or accession_number is required for action='bdc_portfolio'",
+                    suggestions=[
+                        "Provide a BDC ticker (ARCC) or CIK as identifier",
+                        "Or provide accession_number to pin an exact filing",
+                        "Or provide the cursor from a previous page to continue",
+                    ],
                     error_code="INVALID_ARGUMENTS"
                 )
-            return await _bdc_portfolio(identifier, limit)
+            return await bdc_portfolio(
+                identifier=identifier,
+                accession_number=accession_number,
+                form=form or "10-K",
+                period=period,
+                borrower=borrower,
+                cursor=cursor,
+                limit=limit,
+                include_untyped=include_untyped,
+            )
+
+        elif action == "bdc_nonaccrual":
+            if not identifier and not accession_number and not cursor:
+                return error(
+                    "identifier or accession_number is required for action='bdc_nonaccrual'",
+                    suggestions=[
+                        "Provide a BDC ticker (ARCC) or CIK as identifier",
+                        "Or provide accession_number to pin an exact filing",
+                        "Or provide the cursor from a previous page to continue",
+                    ],
+                    error_code="INVALID_ARGUMENTS"
+                )
+            return await bdc_nonaccrual(
+                identifier=identifier,
+                accession_number=accession_number,
+                form=form or "10-K",
+                period=period,
+                cursor=cursor,
+                limit=limit,
+            )
 
         else:
             return error(
                 f"Unknown action: {action}",
-                suggestions=["Use 'lookup', 'search', 'portfolio', 'money_market', 'bdc_search', or 'bdc_portfolio'"]
+                suggestions=[
+                    "Use 'lookup', 'search', 'portfolio', 'money_market', "
+                    "'bdc_search', 'bdc_portfolio', or 'bdc_nonaccrual'"
+                ]
             )
 
     except Exception as e:
@@ -441,171 +542,6 @@ async def _money_market(identifier: str, limit: int) -> Any:
         next_steps = [
             "Use action='lookup' for fund hierarchy and share class details",
             "Use action='search' to find other money market funds",
-        ]
-
-        return success(result, next_steps=next_steps)
-
-    except Exception as e:
-        return error(str(e), suggestions=get_error_suggestions(e))
-
-
-async def _bdc_search(query: str, limit: int) -> Any:
-    """Search for BDCs by name or ticker."""
-    try:
-        from edgar.bdc.search import find_bdc
-
-        results = find_bdc(query, top_n=limit)
-
-        if results.empty:
-            return error(
-                f"No BDCs found matching '{query}'",
-                suggestions=[
-                    "Try a broader search term",
-                    "BDC tickers include ARCC, MAIN, PSEC, FSK",
-                    "Use action='search' for regular investment funds",
-                ]
-            )
-
-        records = []
-        for _, row in results.results.iterrows():
-            record = {
-                "cik": int(row['cik']),
-                "name": row['name'],
-                "ticker": row['ticker'] if row['ticker'] else None,
-                "state": row['state'] if row['state'] else None,
-                "is_active": bool(row['is_active']),
-                "score": int(row['score']),
-            }
-            records.append(record)
-
-        result = {
-            "analysis": "bdc_search",
-            "query": query,
-            "total_results": len(records),
-            "results": records,
-        }
-
-        next_steps = [
-            "Use action='bdc_portfolio' with a ticker or CIK to see investments",
-            "Use edgar_company with a CIK to get full company analysis",
-        ]
-
-        return success(result, next_steps=next_steps)
-
-    except Exception as e:
-        return error(str(e), suggestions=get_error_suggestions(e))
-
-
-async def _bdc_portfolio(identifier: str, limit: int) -> Any:
-    """Get BDC portfolio investments from Schedule of Investments."""
-    try:
-        from edgar.bdc.reference import get_bdc_list
-        from edgar.bdc.search import find_bdc
-
-        bdcs = get_bdc_list()
-        bdc = None
-
-        # Try ticker first
-        bdc = bdcs.get_by_ticker(identifier.upper())
-
-        # Try CIK
-        if bdc is None:
-            try:
-                bdc = bdcs.get_by_cik(int(identifier))
-            except (ValueError, TypeError):
-                pass
-
-        # Try search as fallback
-        if bdc is None:
-            search_results = find_bdc(identifier, top_n=1)
-            if not search_results.empty:
-                bdc = search_results[0]
-
-        if bdc is None:
-            return error(
-                f"Could not find BDC: '{identifier}'",
-                suggestions=[
-                    "Use action='bdc_search' to find BDCs by name",
-                    "Try a ticker (ARCC, MAIN) or CIK number",
-                ]
-            )
-
-        result: dict[str, Any] = {
-            "analysis": "bdc_portfolio",
-            "name": bdc.name,
-            "cik": bdc.cik,
-            "is_active": bdc.is_active,
-        }
-
-        if bdc.state:
-            result["state"] = bdc.state
-
-        # Try portfolio_investments first
-        investments = None
-        try:
-            investments = bdc.portfolio_investments()
-        except Exception:
-            logger.debug("Could not get portfolio_investments")
-
-        if investments is not None and len(investments) > 0:
-            # Extract investment data
-            inv_records = []
-            for inv in investments[:limit]:
-                inv_dict: dict[str, Any] = {}
-                if hasattr(inv, 'name'):
-                    inv_dict["name"] = inv.name
-                if hasattr(inv, 'investment_type'):
-                    inv_dict["type"] = str(inv.investment_type) if inv.investment_type else None
-                if hasattr(inv, 'fair_value') and inv.fair_value is not None:
-                    inv_dict["fair_value"] = float(inv.fair_value) if isinstance(inv.fair_value, Decimal) else inv.fair_value
-                if hasattr(inv, 'cost') and inv.cost is not None:
-                    inv_dict["cost"] = float(inv.cost) if isinstance(inv.cost, Decimal) else inv.cost
-                if hasattr(inv, 'interest_rate') and inv.interest_rate is not None:
-                    inv_dict["interest_rate"] = float(inv.interest_rate) if isinstance(inv.interest_rate, Decimal) else inv.interest_rate
-                if inv_dict:
-                    inv_records.append(inv_dict)
-
-            total_count = len(investments)
-
-            # Compute summary stats
-            total_fair_value = None
-            total_cost = None
-            try:
-                fv_values = [float(i.fair_value) for i in investments if hasattr(i, 'fair_value') and i.fair_value is not None]
-                if fv_values:
-                    total_fair_value = sum(fv_values)
-                cost_values = [float(i.cost) for i in investments if hasattr(i, 'cost') and i.cost is not None]
-                if cost_values:
-                    total_cost = sum(cost_values)
-            except Exception:
-                pass
-
-            result["total_investments"] = total_count
-            if total_fair_value is not None:
-                result["total_fair_value"] = total_fair_value
-            if total_cost is not None:
-                result["total_cost"] = total_cost
-            result["investments"] = inv_records
-
-            if total_count > limit:
-                result["note"] = f"Showing {limit} of {total_count} investments. Increase limit for more."
-
-        else:
-            # Fallback to schedule_of_investments as string representation
-            try:
-                soi = bdc.schedule_of_investments()
-                if soi is not None:
-                    result["schedule_of_investments"] = str(soi)[:4000]
-                    result["note"] = "Showing text summary of Schedule of Investments (structured data unavailable)"
-                else:
-                    result["note"] = "No portfolio investment data available for this BDC"
-            except Exception:
-                result["note"] = "Could not retrieve portfolio investment data for this BDC"
-
-        next_steps = [
-            "Use action='bdc_search' to find other BDCs",
-            "Use edgar_company with this CIK for full company analysis",
-            "Use edgar_read to read the BDC's latest 10-K or 10-Q sections",
         ]
 
         return success(result, next_steps=next_steps)

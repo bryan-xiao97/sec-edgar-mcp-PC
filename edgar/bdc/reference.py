@@ -22,6 +22,7 @@ import httpx
 import pandas as pd
 
 from edgar.display.formatting import cik_text
+from edgar.exceptions import ValidationError
 from edgar.httprequests import get_with_retry, is_unreachable
 
 log = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ __all__ = [
     'get_bdc_list',
     'get_active_bdc_ciks',
     'is_bdc_cik',
+    'lookup_bdc',
     'fetch_bdc_report',
     'get_latest_bdc_report_year',
 ]
@@ -42,6 +44,22 @@ BDC_REPORT_BASE_URL = "https://www.sec.gov/files/investment/data/other/business-
 # Used only when no year answers a probe. Every use is logged: an unconfirmed
 # year presented as confirmed is how a moved dataset reads as current data.
 _BDC_REPORT_FALLBACK_YEAR = 2024
+
+# A BDC counts as actively filing when its latest filing falls within this
+# many months of today (`BDCEntity.is_active`, `filed_within_active_window`).
+ACTIVE_FILING_WINDOW_MONTHS = 18
+
+
+def filed_within_active_window(filing_date: date) -> bool:
+    """True if `filing_date` is within `ACTIVE_FILING_WINDOW_MONTHS` of today.
+
+    The rule behind `BDCEntity.is_active`, exposed so a caller holding a
+    filing date from somewhere other than the BDC Report row (e.g. the
+    company's own submissions, when the row is from a stale report year) can
+    apply the same test.
+    """
+    cutoff = date.today() - relativedelta(months=ACTIVE_FILING_WINDOW_MONTHS)
+    return filing_date >= cutoff
 
 
 @dataclass
@@ -61,6 +79,7 @@ class BDCEntity:
     zip_code: Optional[str] = None
     last_filing_date: Optional[date] = None
     last_filing_type: Optional[str] = None
+    report_year: Optional[int] = None  # set by lookup_bdc(); None from get_bdc_list()
 
     @property
     def is_active(self) -> bool:
@@ -76,8 +95,7 @@ class BDCEntity:
         """
         if not self.last_filing_date:
             return False
-        cutoff = date.today() - relativedelta(months=18)
-        return self.last_filing_date >= cutoff
+        return filed_within_active_window(self.last_filing_date)
 
     def __rich__(self):
 
@@ -142,62 +160,105 @@ class BDCEntity:
             return company.get_filings(form=form)
         return company.get_filings()
 
-    def schedule_of_investments(self, form: str = "10-K"):
+    def _resolve_filing(self, form: str, filing):
         """
-        Get the Schedule of Investments from the latest filing.
+        Resolve the filing to use for investment/SOI extraction.
 
-        Fetches the latest 10-K (or specified form) for this BDC and
-        extracts the Schedule of Investments statement from the XBRL data.
+        If `filing` is given, validate that it belongs to this BDC and use it
+        as-is (this is how a caller pins an exact filing, e.g. by accession
+        number or period, instead of always getting the latest one). Otherwise
+        fall back to the latest non-amendment filing of `form`.
+
+        Raises:
+            ValueError: If `filing` is given but belongs to a different CIK.
+        """
+        if filing is not None:
+            if filing.cik != self.cik:
+                raise ValidationError(
+                    f"Filing belongs to CIK {filing.cik}, not this BDC's CIK {self.cik}.",
+                    parameter="filing",
+                    invalid_value=filing.cik,
+                    suggestions=[f"Pass a filing that belongs to CIK {self.cik}"],
+                )
+            return filing
+
+        company = self.get_company()
+        # Exclude amendments to get full XBRL data
+        filings = company.get_filings(form=form, amendments=False)
+        if len(filings) == 0:
+            return None
+        return filings[0]
+
+    def schedule_of_investments(self, form: str = "10-K", filing=None):
+        """
+        Get the Schedule of Investments from a filing.
+
+        By default, fetches the latest 10-K (or specified form) for this BDC
+        and extracts the Schedule of Investments statement from the XBRL data.
+        Pass `filing` to use a specific, already-selected filing instead (it
+        must belong to this BDC's CIK).
 
         Args:
             form: The form type to use ('10-K' or '10-Q'). Defaults to '10-K'.
+                Ignored when `filing` is given.
+            filing: Optional Filing to use instead of looking up the latest one.
 
         Returns:
             Statement object containing the Schedule of Investments,
             or None if not available.
+
+        Raises:
+            ValueError: If `filing` is given but belongs to a different CIK.
 
         Example:
             >>> arcc = get_bdc_list()[0]
             >>> soi = arcc.schedule_of_investments()
             >>> soi.to_dataframe()
         """
-        company = self.get_company()
-        # Exclude amendments to get full XBRL data
-        filings = company.get_filings(form=form, amendments=False)
-        if len(filings) == 0:
+        target_filing = self._resolve_filing(form, filing)
+        if target_filing is None:
             return None
 
-        latest_filing = filings[0]
-        xbrl = latest_filing.xbrl()
-
+        xbrl = target_filing.xbrl()
         if xbrl is None:
             return None
 
         return xbrl.statements.schedule_of_investments()
 
-    def portfolio_investments(self, form: str = "10-K", include_untyped: bool = False):
+    def portfolio_investments(self, form: str = "10-K", include_untyped: bool = False, filing=None):
         """
-        Get individual portfolio investments from the latest filing.
+        Get individual portfolio investments from a filing.
 
         Parses the Schedule of Investments XBRL data to extract individual
         investment holdings with fair value, cost, interest rate, etc.
 
         This method tries two extraction approaches:
-        1. Statement-based: Uses the XBRL presentation hierarchy
-        2. Facts-based: Extracts directly from XBRL facts with dimensions
+        1. Facts-based: Extracts directly from XBRL facts with dimensions
+        2. Statement-based: Uses the XBRL presentation hierarchy
 
         Some BDCs (like Blue Owl) have dimensional investment data in facts
         but not in the Statement presentation hierarchy, so both approaches
         are attempted.
 
+        By default, uses the latest 10-K (or specified form) for this BDC.
+        Pass `filing` to use a specific, already-selected filing instead (it
+        must belong to this BDC's CIK) — useful when a caller has pinned an
+        exact filing by accession number or period rather than wanting the
+        latest one.
+
         Args:
             form: The form type to use ('10-K' or '10-Q'). Defaults to '10-K'.
+                Ignored when `filing` is given.
             include_untyped: If False (default), excludes investments with "Unknown"
                 type. These are typically company-level rollup entries that would
                 inflate totals. Set to True to include all entries.
+            filing: Optional Filing to use instead of looking up the latest one.
 
         Returns:
             PortfolioInvestments collection, or None if not available.
+
+        Raises:
+            ValueError: If `filing` is given but belongs to a different CIK.
 
         Example:
             >>> arcc = get_bdc_list()[0]
@@ -209,29 +270,13 @@ class BDCEntity:
             >>> investments.filter(investment_type='First lien')
             PortfolioInvestments with first lien loans
         """
-        from edgar.bdc.investments import PortfolioInvestments
+        from edgar.bdc.investments import portfolio_investments_from_filing
 
-        # Get XBRL for the filing
-        company = self.get_company()
-        filings = company.get_filings(form=form, amendments=False)
-        if len(filings) == 0:
+        target_filing = self._resolve_filing(form, filing)
+        if target_filing is None:
             return None
 
-        xbrl = filings[0].xbrl()
-        if xbrl is None:
-            return None
-
-        # Try facts-based extraction first (works for more BDCs)
-        investments = PortfolioInvestments.from_xbrl(xbrl, include_untyped=include_untyped)
-        if len(investments) > 0:
-            return investments
-
-        # Fall back to statement-based extraction
-        soi = xbrl.statements.schedule_of_investments()
-        if soi is None:
-            return None
-
-        return PortfolioInvestments.from_statement(soi, include_untyped=include_untyped)
+        return portfolio_investments_from_filing(target_filing, include_untyped=include_untyped)
 
     def has_detailed_investments(self, form: str = "10-K") -> bool:
         """
@@ -503,11 +548,18 @@ def _excel_serial_to_date(serial: float) -> Optional[date]:
         return None
 
 
+@lru_cache(maxsize=1)
 def get_latest_bdc_report_year() -> int:
     """
     Determine the latest available year for the SEC BDC Report.
 
     Checks backwards from the current year to find available reports.
+    Cached for the life of the process (``lru_cache``): every probe hits SEC,
+    so an uncached call here meant `lookup_bdc` (and anything else that calls
+    this directly rather than through `fetch_bdc_report`'s own cache) issued
+    a fresh round of HTTP probes on every call. Tests that need a fresh probe
+    per call must clear the cache themselves (``get_latest_bdc_report_year.
+    cache_clear()``).
 
     Returns:
         The latest year with an available BDC report.
@@ -758,3 +810,77 @@ def is_bdc_cik(cik: int) -> bool:
     """
     bdcs = get_bdc_list()
     return any(bdc.cik == cik for bdc in bdcs)
+
+
+def lookup_bdc(
+    cik: Optional[int] = None,
+    ticker: Optional[str] = None,
+    lookback_years: int = 2,
+) -> Optional[BDCEntity]:
+    """
+    Look up a BDC by CIK or ticker, falling back to prior report years.
+
+    The SEC's annual BDC Report can omit an active BDC from a given year's
+    snapshot even though the company is still an active, filing BDC:
+    measured 2026-09-28, Ares Capital Corp (CIK 1287750) is present in the
+    2024 and 2025 reports but missing from the 2026 one. `is_bdc_cik()` and
+    a bare `get_bdc_list().get_by_cik()`/`get_by_ticker()` only ever consult
+    the latest report, so both silently say "not a BDC" for an entity like
+    that. This checks the latest report first, then up to `lookback_years`
+    prior years, returning the first match -- so "dropped from the latest
+    snapshot" is not treated the same as "not a BDC".
+
+    Args:
+        cik: SEC CIK number to look up.
+        ticker: Ticker symbol to look up (case-insensitive). `BDCEntities.
+            get_by_ticker()` resolves the ticker against SEC's current
+            ticker-to-CIK mapping (not year-versioned) before checking that
+            CIK against the given report year, so an older year's report is
+            still checked against today's correct ticker mapping.
+        lookback_years: How many prior report years to check if the latest
+            report has no match (default 2).
+
+    Returns:
+        The first matching BDCEntity, or None if not found in the latest
+        report or any of the lookback years. The match carries an additive
+        `report_year` attribute set to the report year it was found in, so a
+        caller (e.g. `is_active`, Task Q2) can tell a latest-year hit from a
+        lookback hit.
+
+    Raises:
+        ValidationError: If neither `cik` nor `ticker` is given.
+    """
+    if cik is None and ticker is None:
+        raise ValidationError(
+            "lookup_bdc requires cik or ticker",
+            suggestions=["Pass cik=<SEC CIK> or ticker=<symbol>"],
+        )
+
+    latest_year = get_latest_bdc_report_year()
+    for year in range(latest_year, latest_year - lookback_years - 1, -1):
+        try:
+            # The latest year uses the bare get_bdc_list() (year=None) so it
+            # shares fetch_bdc_report's lru_cache entry with every other bare
+            # caller (is_bdc_cik, get_active_bdc_ciks, ...) instead of
+            # fetching the identical CSV again under a second cache key.
+            bdcs = get_bdc_list(None if year == latest_year else year)
+        except Exception as e:
+            log.warning(
+                "Could not fetch the %d BDC report while looking up a BDC (%s: %s); skipping.",
+                year, type(e).__name__, e,
+            )
+            continue
+
+        if cik is not None:
+            match = bdcs.get_by_cik(cik)
+            if match is not None:
+                match.report_year = year
+                return match
+
+        if ticker is not None:
+            match = bdcs.get_by_ticker(ticker)
+            if match is not None:
+                match.report_year = year
+                return match
+
+    return None

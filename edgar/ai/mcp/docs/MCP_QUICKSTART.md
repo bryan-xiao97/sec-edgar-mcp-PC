@@ -226,6 +226,41 @@ See [hackerdogs/edgartools-mcp](https://hub.docker.com/r/hackerdogs/edgartools-m
 
 Once connected, AI agents have access to these tools:
 
+The server registers 14 tools. `edgar_read` extracts report sections such as
+MD&A or risk factors; `edgar_document` works with exact attachments and
+exhibits, keeping filename identity in search locators and continuation calls.
+
+### Private Credit Prompt Templates
+
+Select these templates through your MCP client's prompt menu. They guide the
+assistant through retrieving evidence with the existing tools.
+
+| Prompt | Required arguments | Optional arguments |
+|---|---|---|
+| `borrower_credit_review` | `borrower`, `bdc` | `period`, `comparison_period` (reporting period ends in YYYY-MM-DD format) |
+| `lender_protection_review` | `borrower` | `filing_or_url` (SEC accession or document URL), `focus` |
+
+For example, render a borrower review for a specific quarter:
+
+```python
+from edgar.ai.mcp.tools.prompts import get_prompt
+
+review = get_prompt("borrower_credit_review", {
+    "borrower": "Ivy Hill",
+    "bdc": "ARCC",
+    "period": "2026-06-30",
+    "comparison_period": "2025-06-30",
+})
+print(review.messages[0].content.text)
+```
+
+For agreement research, select `lender_protection_review` with the borrower name
+and optionally an SEC filing/document and a focus such as "guarantees and release
+provisions". The workflow checks the parties and obligations covered by each
+document, follows relevant passages and explains missing evidence. Prompt
+rendering creates instructions; the assistant executes the tool calls during the
+conversation. Neither template promises a risk score or a recovery estimate.
+
 #### 1. edgar_company
 Get company profile, financials, recent filings, and ownership in one call.
 
@@ -389,6 +424,39 @@ Drill into financial statement notes and disclosures — the detail behind the n
 - `topic`: Note topic to search for (e.g., "revenue", "debt", "leases", "contingencies"). Omit for table of contents.
 - `form` (default: "10-K"): Filing form type. Use "10-Q" for quarterly notes.
 - `detail` (default: "standard"): `minimal` (titles only), `standard` (context + tables), or `full` (includes DataFrame data)
+
+#### 14. edgar_document
+List, search and read exact documents attached to a filing. Select a document
+by sequence, filename or exhibit type; resolve ambiguous types using a
+candidate's exact sequence or filename. An HTTPS SEC Archives document URL
+binds the accession and filename and is validated as identity, not fetched.
+
+Search locators contain `document` and `char_offset`; pass both through
+`around` for a bounded read centered on the match. Reads return at most 6,000
+characters per page. Search is capped at 1,000 candidates per filing and
+2,048 characters per match; regex has a 50 ms per-document timeout. Exhibits
+incorporated by reference may belong to an earlier filing. A BDC filing may
+report a portfolio borrower without containing that borrower's own agreement.
+
+<!-- MCP_TOOL_CALL_EXAMPLE -->
+```json
+{"tool":"edgar_document","arguments":{"action":"list","accession_number":"0001628280-26-050307"}}
+```
+
+<!-- MCP_TOOL_CALL_EXAMPLE -->
+```json
+{"tool":"edgar_document","arguments":{"action":"read","accession_number":"0001628280-26-050307","document":"[exact-filename-from-list]"}}
+```
+
+<!-- MCP_TOOL_CALL_EXAMPLE -->
+```json
+{"tool":"edgar_document","arguments":{"action":"read","accession_number":"0001628280-26-050307","document":"[exact-filename-from-list]","cursor":"<page.next_cursor>"}}
+```
+
+<!-- MCP_TOOL_CALL_EXAMPLE -->
+```json
+{"tool":"edgar_document","arguments":{"action":"read","url":"https://www.sec.gov/Archives/edgar/data/320193/000032019325000073/a10-qexhibit32103292025.htm"}}
+```
 
 ## Environment Variables
 

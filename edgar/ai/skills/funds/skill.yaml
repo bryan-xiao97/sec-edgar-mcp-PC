@@ -5,6 +5,18 @@ version: "1.0"
 identity: Investment fund analyst. Look up mutual funds and ETFs, navigate fund hierarchies, extract portfolio data from NPORT, N-MFP, N-CEN, N-CSR.
 
 patterns:
+  - name: Private Credit MCP Prompts
+    when: User wants guided borrower credit or lender protection research through MCP
+    code: |
+      from edgar.ai.mcp.tools.prompts import get_prompt
+      review = get_prompt("borrower_credit_review", {
+          "borrower": "Ivy Hill", "bdc": "ARCC", "period": "2026-06-30"
+      })
+      protections = get_prompt("lender_protection_review", {
+          "borrower": "Example Borrower", "focus": "collateral and guarantees"
+      })
+    note: Requires the AI extra. Prompt rendering produces instructions; the MCP client runs the evidence retrieval workflow. Preserve filing identity and disclose missing evidence.
+
   - name: Fund Lookup
     when: User asks about a mutual fund or ETF
     code: |
@@ -74,6 +86,21 @@ patterns:
       and from a peer BDC's tag for the same issuer; industry_source says
       which. An investment with no recoverable industry has industry, sector
       and industry_source all None, never an empty string.
+
+  - name: BDC Portfolio From a Chosen Filing
+    when: Need holdings from a SPECIFIC 10-K/10-Q (a chosen quarter, not just the latest)
+    code: |
+      from edgar import find
+      from edgar.bdc import get_bdc_list, portfolio_investments_from_filing
+
+      filing = find("0001628280-26-050307")     # or company.get_filings(form="10-Q")...
+      investments = portfolio_investments_from_filing(filing)
+      investments.extraction_method              # 'xbrl_facts' or 'statement'
+
+      # Same filing via the BDC entity, once resolved
+      arcc = get_bdc_list().get_by_ticker("ARCC")
+      arcc.portfolio_investments(filing=filing)
+      arcc.schedule_of_investments(filing=filing)
 
   - name: Report Backlinks
     when: Navigate from report to filing
