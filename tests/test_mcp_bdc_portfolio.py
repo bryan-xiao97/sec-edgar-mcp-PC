@@ -1808,6 +1808,8 @@ class TestBdcPortfolioARCCLive:
         `lookup_bdc` (with lookback), not the latest-report-only
         `is_bdc_cik`. ARCC's own 10-Q accession, given with no identifier,
         must not come back NOT_A_BDC."""
+        from edgar.bdc.reference import lookup_bdc
+
         set_identity("Test User test@test.com")
 
         result = await edgar_fund(action="bdc_portfolio", accession_number=ARCC_10Q_ACCESSION)
@@ -1816,8 +1818,14 @@ class TestBdcPortfolioARCCLive:
         assert result.data["cik"] == ARCC_CIK
         assert result.data["source"]["selected_by"] == "accession"
         assert result.data["total_investments"] == ARCC_10Q_HOLDING_COUNT
-        # P1-M5: accession-only path, lookback-year (2025) match.
-        assert result.data["bdc_report_year"] == 2025
+        # P1-M5: the accession-only path resolves ARCC through the same
+        # `lookup_bdc` lookback that the accession path itself uses. Which
+        # report year that lands on drifts as SEC republishes each BDC
+        # Report (ARCC was in the 2025 report as of 2026-09-29, absent from
+        # 2026's) -- so the expected year is computed here, not hard-coded.
+        expected_year = lookup_bdc(cik=ARCC_CIK).report_year
+        assert isinstance(expected_year, int) and expected_year >= 2025
+        assert result.data["bdc_report_year"] == expected_year
         assert result.data["is_active"] is True
 
 
@@ -1878,12 +1886,20 @@ class TestBdcPortfolioPrincetonVCR:
 @pytest.mark.network
 class TestBdcNameSearchLive:
     """P1-M2(c), live (BDC report CSVs + SEC ticker map only; no XBRL). ARCC
-    is absent from the 2026 BDC Report (measured 2026-09-28/29), so its
-    registrant name only resolves when the name-search index covers the
-    `lookup_bdc` lookback years."""
+    has been absent from at least one recent BDC Report (measured
+    2026-09-28/29, that was the 2026 report), so its registrant name only
+    resolves when the name-search index covers the `lookup_bdc` lookback
+    years. Which year it actually resolves through drifts as SEC republishes
+    the report annually, so the test computes that year rather than assuming
+    a fixed one."""
 
     def test_arcc_registrant_name_resolves_to_cik_1287750(self):
+        from edgar.bdc.reference import lookup_bdc
+
         set_identity("Test User test@test.com")
+
+        expected_year = lookup_bdc(cik=ARCC_CIK).report_year
+        assert isinstance(expected_year, int) and expected_year >= 2025
 
         lookup = bdc_identity.resolve_bdc("Ares Capital Corp")
 
@@ -1891,5 +1907,5 @@ class TestBdcNameSearchLive:
         assert lookup.bdc is not None
         assert lookup.bdc.cik == ARCC_CIK
         assert lookup.bdc.name == "ARES CAPITAL CORP"
-        assert lookup.bdc.report_year == 2025
+        assert lookup.bdc.report_year == expected_year
         assert lookup.resolved_by == "search"

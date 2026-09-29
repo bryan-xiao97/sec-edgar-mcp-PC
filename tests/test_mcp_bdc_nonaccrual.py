@@ -632,6 +632,8 @@ class TestBdcNonaccrualARCCLive:
     """
 
     async def test_period_selects_ground_truth_filing_and_footnote_evidence(self):
+        from edgar.bdc.reference import lookup_bdc
+
         set_identity("Test User test@test.com")
 
         response = await edgar_fund(
@@ -645,9 +647,15 @@ class TestBdcNonaccrualARCCLive:
         assert response.data["warnings"] == []
         assert response.data["source"]["accession_number"] == ARCC_10Q_ACCESSION
         assert response.data["cik"] == ARCC_CIK
-        # P1-M5: ARCC is only in the 2025 BDC Report (measured 2026-09-29);
-        # is_active comes from its own latest filing, not that stale row.
-        assert response.data["bdc_report_year"] == 2025
+        # P1-M5: is_active comes from ARCC's own latest filing, not a
+        # possibly-stale report row. Which report year ARCC actually
+        # resolves through drifts as SEC republishes the BDC Report
+        # annually (it was missing from the 2026 report as of 2026-09-29),
+        # so the expected year is computed here via the same `lookup_bdc`
+        # lookback the code path itself uses, not hard-coded.
+        expected_year = lookup_bdc(cik=ARCC_CIK).report_year
+        assert isinstance(expected_year, int) and expected_year >= 2025
+        assert response.data["bdc_report_year"] == expected_year
         assert response.data["is_active"] is True
 
     async def test_hand_verified_investment_identifier_and_footnote(self):
