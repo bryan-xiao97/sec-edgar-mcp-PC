@@ -130,6 +130,10 @@ class TestEdgarDocumentPrincetonVCR:
         ]
         assert {m["match_text"].lower() for m in net_asset_value.data["matches"]} == {"net asset value"}
         assert "Net\nasset value" in {m["match"] for m in net_asset_value.data["matches"]}
+        first_lien = await edgar_document(action="search", accession_number=PRINCETON_ACCESSION,
+                                          query="first lien", limit=50)
+        assert first_lien.data["page"]["total"] == 20
+        assert "First   Lien" in {m["match"] for m in first_lien.data["matches"]}
         section_1350 = await edgar_document(action="search", accession_number=PRINCETON_ACCESSION, document="EX-32",
                                             query="Section 1350")
         assert [(m["locator"]["char_offset"], m["match"]) for m in section_1350.data["matches"]] == [

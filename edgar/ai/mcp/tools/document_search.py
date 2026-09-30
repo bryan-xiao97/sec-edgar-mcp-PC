@@ -12,9 +12,10 @@ directly misses body text a reader plainly sees (Q4 review findings I1 and
 Gap A), so queries run against a *reader view* of the rendered text:
 
 - Escapes are removed exactly where ``edgar.documents``' renderer adds them:
-  the characters ``\\ ` * _ { } [ ] ( ) # + - . !`` outside markdown table rows.
-  Table rows are never escaped by the renderer, so a backslash there is real
-  (Gap B).
+  the characters ``\\ ` * _ { } [ ] ( ) # + - . !`` in prose. Table text is
+  never escaped by the renderer, so a backslash there is real (Gap B).
+  Table rows are recognized by the pipe renderer's row grammar, not by a
+  leading ``|`` alone (round 3): see ``_table_rows``.
 - For literal queries, every run of whitespace (spaces, tabs, newlines,
   non-breaking spaces) becomes one space, and so does every run in the
   query. ``|`` is not whitespace, so a literal match never spans a table-cell
@@ -52,7 +53,9 @@ CONTEXT_CHARS = 100
 _ESCAPE = r"\\[\\`*_{}\[\]()#+\-.!]"
 _ESCAPE_TOKEN = re.compile(_ESCAPE)
 _ESCAPE_OR_WHITESPACE_TOKEN = re.compile(_ESCAPE + r"|\s{2,}|[^\S ]")
-_TABLE_ROW = re.compile(r"^[ \t]*\|[^\n]*", re.MULTILINE)
+# The pipe renderer writes every row as "| " + " | ".join(cells) + " |",
+# indented when the table sits in a list item.
+_ROW_START = re.compile(r"[ \t]*\| ")
 _WHITESPACE_RUN = re.compile(r"\s+")
 
 
@@ -126,8 +129,45 @@ class ReaderView(NamedTuple):
 
 
 def _table_rows(text: str) -> tuple[list[int], list[int]]:
-    rows = [(m.start(), m.end()) for m in _TABLE_ROW.finditer(text)]
-    return [start for start, _ in rows], [end for _, end in rows]
+    """Start and end offsets of every rendered table row, in order.
+
+    ``MarkdownRenderer._render_table_pipe`` (the format ``Attachment.markdown()``
+    uses) writes each row as ``"| " + " | ".join(cells) + " |"`` with stripped
+    cells, which may contain newlines and even blank lines. A row therefore
+    starts on a line matching ``[ \\t]*\\| `` and closes on the first line that
+    ends with `` |``; its continuation lines never start with ``| `` and never
+    end with `` |`` while cells are pipe-free. A candidate that does not close
+    before the next row start or the end of text is prose, so the reviewer's
+    ``|x| = 5 ...`` line and prose that merely starts with ``| `` stay
+    escaped. Unclassified text defaults to prose on purpose: calling prose a
+    table would leave its escapes in place (a common false negative), while
+    calling a table prose only mis-reads a genuine backslash followed by an
+    escapable character in a cell (rare in SEC tables).
+    """
+    starts: list[int] = []
+    ends: list[int] = []
+    lines = text.split("\n")
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line) + 1)
+    index = 0
+    while index < len(lines):
+        if not _ROW_START.match(lines[index]):
+            index += 1
+            continue
+        close = index
+        while not lines[close].endswith(" |"):
+            close += 1
+            if close == len(lines) or _ROW_START.match(lines[close]):
+                close = None
+                break
+        if close is None:
+            index += 1
+            continue
+        starts.append(offsets[index])
+        ends.append(offsets[close] + len(lines[close]))
+        index = close + 1
+    return starts, ends
 
 
 def _in_table_row(position: int, starts: list[int], ends: list[int]) -> bool:

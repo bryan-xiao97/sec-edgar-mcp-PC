@@ -444,7 +444,7 @@ document (PDF, image, paper, empty) returns `unreadable_reason`, and an
 all-documents search lists skipped attachments in `unsearched_documents`.
 Queries match the text as a reader sees it: markdown backslash escapes are
 ignored (`15\(d\)` matches `15(d)`), and in a literal query any run of spaces,
-tabs or line breaks matches any other run (`net asset value` matches
+tabs, line breaks or non-breaking spaces matches any other run (`net asset value` matches
 `Net\nasset value`). A literal match crosses a table-cell boundary (`|`) only if
 the query contains `|`.
 Regex queries keep their own whitespace semantics; use `\s+` to tolerate line
