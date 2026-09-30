@@ -520,11 +520,15 @@ class TestArgumentAndSelectionErrors:
         filing = _FakeFiling(cik=320193, accession_number="0000320193-24-000001")
         _patch_selection(monkeypatch, filing)
         monkeypatch.setattr("edgar.bdc.reference.lookup_bdc", lambda **kwargs: None)
+        monkeypatch.setattr(bdc_identity, "_report_years_checked", lambda: [2024, 2025, 2026])
 
         result = await edgar_fund(action="bdc_portfolio", accession_number="0000320193-24-000001")
 
         assert result.success is False
         assert result.error_code == "NOT_A_BDC"
+        assert result.error.startswith(
+            "CIK 320193 is not listed in the SEC BDC Report for 2024, 2025 and 2026."
+        )
 
 
 # =============================================================================
@@ -617,7 +621,13 @@ class TestLookupBdcLookback:
     """`edgar.bdc.reference.lookup_bdc`: checks the latest SEC BDC Report
     first, then falls back to prior years -- the real-world motivation is
     that the 2026 report is missing Ares Capital Corp, present in 2024 and
-    2025 (see the fix-round-1 report)."""
+    2025 (see the fix-round-1 report).
+
+    The fakes model today's `get_bdc_list` semantics (GH #1146): an explicit
+    year is that year's report exactly, and `year=None` is the UNION of the
+    recent reports. A `lookup_bdc` that consulted the union for "the latest
+    year" would label ARCC's 2025 row as 2026 (final review I1), and these
+    fakes make that visible."""
 
     class _FakeBdcEntities:
         def __init__(self, ciks=(), tickers=None):
@@ -631,55 +641,63 @@ class TestLookupBdcLookback:
             cik = self._tickers.get(ticker)
             return _FakeBDC(cik=cik, name="Some BDC") if cik is not None else None
 
+    @classmethod
+    def _fake_get_bdc_list(cls, per_year: dict, calls: Optional[list] = None):
+        """`get_bdc_list` over `per_year` ({year: (ciks, tickers)}); `None`
+        returns the union of every year, as the real function does."""
+        def _get_bdc_list(year=None):
+            if calls is not None:
+                calls.append(year)
+            if year is None:
+                ciks = set().union(*(c for c, _ in per_year.values()))
+                tickers = {k: v for _, t in per_year.values() for k, v in t.items()}
+                return cls._FakeBdcEntities(ciks=ciks, tickers=tickers)
+            ciks, tickers = per_year.get(year, ((), {}))
+            return cls._FakeBdcEntities(ciks=ciks, tickers=tickers)
+        return _get_bdc_list
+
+    ARCC_ONLY_IN_2025 = {2026: ((), {}), 2025: ({1287750}, {"ARCC": 1287750}), 2024: ((), {})}
+
     def test_latest_report_miss_falls_back_to_prior_year(self, monkeypatch):
         from edgar.bdc import reference
 
-        def _fake_get_bdc_list(year=None):
-            if year == 2026:
-                return self._FakeBdcEntities(ciks=())
-            if year == 2025:
-                return self._FakeBdcEntities(ciks={1287750})
-            return self._FakeBdcEntities(ciks=())
-
         monkeypatch.setattr(reference, "get_latest_bdc_report_year", lambda: 2026)
-        monkeypatch.setattr(reference, "get_bdc_list", _fake_get_bdc_list)
+        monkeypatch.setattr(reference, "get_bdc_list", self._fake_get_bdc_list(self.ARCC_ONLY_IN_2025))
 
         result = reference.lookup_bdc(cik=1287750, lookback_years=2)
 
         assert result is not None
         assert result.cik == 1287750
+        assert result.report_year == 2025
 
     def test_latest_report_hit_never_checks_prior_years(self, monkeypatch):
-        """The latest-year iteration calls get_bdc_list(None) -- the same
-        call a bare get_bdc_list() makes -- so it shares fetch_bdc_report's
-        cache entry instead of fetching the identical CSV again under an
-        explicit-year key (QA fix wave, P1-L1)."""
+        """The latest year is read by its explicit year, never through the
+        bare get_bdc_list() union (final review I1 / deferred #12). That costs
+        no extra download: `_combined_bdc_report` fetches every year under the
+        same `fetch_bdc_report(year)` cache key."""
         from edgar.bdc import reference
 
         years_checked = []
-
-        def _fake_get_bdc_list(year=None):
-            years_checked.append(year)
-            return self._FakeBdcEntities(ciks={1287750})
-
         monkeypatch.setattr(reference, "get_latest_bdc_report_year", lambda: 2026)
-        monkeypatch.setattr(reference, "get_bdc_list", _fake_get_bdc_list)
+        monkeypatch.setattr(
+            reference, "get_bdc_list",
+            self._fake_get_bdc_list({2026: ({1287750}, {})}, calls=years_checked),
+        )
 
         result = reference.lookup_bdc(cik=1287750, lookback_years=2)
 
         assert result is not None
-        assert years_checked == [None]
+        assert years_checked == [2026]
 
     def test_latest_match_carries_the_matched_report_year(self, monkeypatch):
         """P1-M5 (library part): the match exposes which report year it came
-        from via an additive `report_year` attribute, even though the call
-        into get_bdc_list() for that year used None."""
+        from via an additive `report_year` attribute."""
         from edgar.bdc import reference
 
         monkeypatch.setattr(reference, "get_latest_bdc_report_year", lambda: 2026)
         monkeypatch.setattr(
             reference, "get_bdc_list",
-            lambda year=None: self._FakeBdcEntities(ciks={1287750}),
+            self._fake_get_bdc_list({2026: ({1287750}, {}), 2025: ({1287750}, {})}),
         )
 
         result = reference.lookup_bdc(cik=1287750, lookback_years=2)
@@ -689,13 +707,8 @@ class TestLookupBdcLookback:
     def test_lookback_match_carries_the_matched_report_year(self, monkeypatch):
         from edgar.bdc import reference
 
-        def _fake_get_bdc_list(year=None):
-            if year == 2025:
-                return self._FakeBdcEntities(ciks={1287750})
-            return self._FakeBdcEntities(ciks=())
-
         monkeypatch.setattr(reference, "get_latest_bdc_report_year", lambda: 2026)
-        monkeypatch.setattr(reference, "get_bdc_list", _fake_get_bdc_list)
+        monkeypatch.setattr(reference, "get_bdc_list", self._fake_get_bdc_list(self.ARCC_ONLY_IN_2025))
 
         result = reference.lookup_bdc(cik=1287750, lookback_years=2)
 
@@ -704,18 +717,14 @@ class TestLookupBdcLookback:
     def test_ticker_lookback_hit(self, monkeypatch):
         from edgar.bdc import reference
 
-        def _fake_get_bdc_list(year=None):
-            if year == 2025:
-                return self._FakeBdcEntities(tickers={"ARCC": 1287750})
-            return self._FakeBdcEntities()
-
         monkeypatch.setattr(reference, "get_latest_bdc_report_year", lambda: 2026)
-        monkeypatch.setattr(reference, "get_bdc_list", _fake_get_bdc_list)
+        monkeypatch.setattr(reference, "get_bdc_list", self._fake_get_bdc_list(self.ARCC_ONLY_IN_2025))
 
         result = reference.lookup_bdc(ticker="ARCC", lookback_years=2)
 
         assert result is not None
         assert result.cik == 1287750
+        assert result.report_year == 2025
 
     def test_no_match_in_any_lookback_year_returns_none(self, monkeypatch):
         from edgar.bdc import reference
@@ -744,8 +753,10 @@ class TestLookupBdcLookback:
 
 @pytest.mark.fast
 class TestGetLatestBdcReportYearCaching:
-    """P1-L1: get_latest_bdc_report_year() is lru_cached, so a second call in
-    the same process does not re-probe SEC."""
+    """P1-L1: a confirmed get_latest_bdc_report_year() is cached, so a second
+    call in the same process does not re-probe SEC. What is and is not cached
+    (a transient failure never; a confirmed year for 24 h) is covered in
+    tests/test_bdc_report_provenance.py (final review I2)."""
 
     @pytest.fixture(autouse=True)
     def _clear_cache(self):
@@ -960,6 +971,7 @@ class TestPatchSeamsAreLive:
 
         monkeypatch.setattr("edgar.bdc.reference.lookup_bdc", lambda **kwargs: None)
         monkeypatch.setattr(bdc_identity, "resolve_company", _resolve)
+        monkeypatch.setattr(bdc_identity, "_report_years_checked", lambda: [2024, 2025, 2026])
 
         result = await edgar_fund(action="bdc_portfolio", identifier="320193")
 
@@ -1533,11 +1545,14 @@ class TestNameSearchResolutionRules:
 @pytest.mark.fast
 @pytest.mark.asyncio
 class TestNumericIdentifierNotABdc:
-    """P1-L10: a numeric identifier that is a real company but not a BDC is
-    NOT_A_BDC (as on the accession path), not COMPANY_NOT_FOUND."""
+    """P1-L10: a numeric identifier that is a real company absent from every
+    checked SEC BDC Report is NOT_A_BDC (as on the accession path), not
+    COMPANY_NOT_FOUND. The message says "not listed", never "not a BDC"
+    (final review I3)."""
 
     async def test_real_non_bdc_cik_is_not_a_bdc(self, monkeypatch):
         monkeypatch.setattr("edgar.bdc.reference.lookup_bdc", lambda **kwargs: None)
+        monkeypatch.setattr(bdc_identity, "_report_years_checked", lambda: [2024, 2025, 2026])
         resolved = []
         monkeypatch.setattr(
             bdc_identity, "resolve_company", lambda identifier: resolved.append(identifier) or _FakeCompany(cik=320193)
@@ -1703,6 +1718,35 @@ PRINCETON_10Q_ACCESSION = "0001213900-26-090000"
 PRINCETON_10Q_HOLDING_COUNT = 23
 
 
+def newest_report_year_listing(cik: int) -> int:
+    """Independent oracle for a live `bdc_report_year` (final review I1).
+
+    Reads each SEC BDC Report year's CSV directly (`fetch_bdc_report(year)`,
+    newest first from the current calendar year; a year SEC has not published
+    is a 404) and returns the newest year whose rows contain `cik`. It does not
+    call `lookup_bdc`, `get_bdc_list` or `get_latest_bdc_report_year`, the code
+    under test, so it cannot agree with a mislabelled year by construction the
+    way `lookup_bdc(cik=...).report_year` did.
+    """
+    from datetime import date
+
+    import httpx
+
+    from edgar.bdc.reference import fetch_bdc_report
+
+    this_year = date.today().year
+    for year in range(this_year, this_year - 4, -1):
+        try:
+            report = fetch_bdc_report(year)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                continue
+            raise
+        if cik in set(report["cik"].dropna().astype(int)):
+            return year
+    raise AssertionError(f"CIK {cik} is in no SEC BDC Report from {this_year - 3} to {this_year}")
+
+
 @pytest.mark.network
 @pytest.mark.asyncio
 class TestBdcPortfolioARCCLive:
@@ -1808,8 +1852,6 @@ class TestBdcPortfolioARCCLive:
         `lookup_bdc` (with lookback), not the latest-report-only
         `is_bdc_cik`. ARCC's own 10-Q accession, given with no identifier,
         must not come back NOT_A_BDC."""
-        from edgar.bdc.reference import lookup_bdc
-
         set_identity("Test User test@test.com")
 
         result = await edgar_fund(action="bdc_portfolio", accession_number=ARCC_10Q_ACCESSION)
@@ -1818,14 +1860,14 @@ class TestBdcPortfolioARCCLive:
         assert result.data["cik"] == ARCC_CIK
         assert result.data["source"]["selected_by"] == "accession"
         assert result.data["total_investments"] == ARCC_10Q_HOLDING_COUNT
-        # P1-M5: the accession-only path resolves ARCC through the same
-        # `lookup_bdc` lookback that the accession path itself uses. Which
-        # report year that lands on drifts as SEC republishes each BDC
-        # Report (ARCC was in the 2025 report as of 2026-09-29, absent from
-        # 2026's) -- so the expected year is computed here, not hard-coded.
-        expected_year = lookup_bdc(cik=ARCC_CIK).report_year
-        assert isinstance(expected_year, int) and expected_year >= 2025
-        assert result.data["bdc_report_year"] == expected_year
+        # P1-M5 / final review I1: `bdc_report_year` is the report the row
+        # actually came from. It drifts as SEC republishes the BDC Report
+        # (ARCC: in 2024 and 2025, absent from 2026, measured 2026-09-30), so
+        # the expected year comes from an independent oracle that reads each
+        # year's CSV directly, never from the code under test.
+        assert result.data["bdc_report_year"] == newest_report_year_listing(ARCC_CIK)
+        # ARCC files every quarter. When its row is from an older report,
+        # is_active comes from its own latest filing, not the stale row.
         assert result.data["is_active"] is True
 
 
@@ -1890,16 +1932,14 @@ class TestBdcNameSearchLive:
     2026-09-28/29, that was the 2026 report), so its registrant name only
     resolves when the name-search index covers the `lookup_bdc` lookback
     years. Which year it actually resolves through drifts as SEC republishes
-    the report annually, so the test computes that year rather than assuming
-    a fixed one."""
+    the report annually, so the expected year comes from the independent
+    `newest_report_year_listing` oracle (final review I1), not from
+    `lookup_bdc`, the code under test."""
 
     def test_arcc_registrant_name_resolves_to_cik_1287750(self):
-        from edgar.bdc.reference import lookup_bdc
-
         set_identity("Test User test@test.com")
 
-        expected_year = lookup_bdc(cik=ARCC_CIK).report_year
-        assert isinstance(expected_year, int) and expected_year >= 2025
+        expected_year = newest_report_year_listing(ARCC_CIK)
 
         lookup = bdc_identity.resolve_bdc("Ares Capital Corp")
 

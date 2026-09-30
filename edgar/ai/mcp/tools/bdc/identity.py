@@ -3,7 +3,9 @@ BDC identity for edgar_fund: which BDC, and which filing.
 
 - `bdc_search`: the `action="bdc_search"` name/ticker listing.
 - `resolve_bdc`: identifier (ticker, CIK or name) -> BDC, with the name-search
-  auto-select rule (P1-M2) and NOT_A_BDC for real non-BDC companies (P1-L10).
+  auto-select rule (P1-M2) and NOT_A_BDC for a real company that is not listed
+  in the SEC BDC Report years checked (P1-L10). That report omits some BDCs, so
+  NOT_A_BDC says "not listed", never "not a BDC" (final review I3).
 - `is_active` for a match from a stale report year (P1-M5) and the shared
   identity block (`bdc_identity_fields`).
 - `resolve_bdc_and_filing`: the BDC plus the one chosen filing.
@@ -92,7 +94,8 @@ class BdcLookup:
 
     At most one of `bdc`/`ambiguous`/`not_a_bdc_cik` is set. All three
     `None` means "not found". `not_a_bdc_cik` means the identifier is a real
-    company, just not a BDC in any checked report year. `resolved_by` is set
+    company that no checked SEC BDC Report year lists; the report is
+    incomplete, so that is not proof it is not a BDC. `resolved_by` is set
     to `"search"` when a fuzzy name search (rather than a direct ticker/CIK
     hit) produced `bdc`.
     """
@@ -143,7 +146,7 @@ def _try_resolve_company(identifier: str):
 
 
 def _find_bdc_by_cik(cik: int) -> BdcLookup:
-    """CIK path: a real company that isn't a BDC is `not_a_bdc_cik` (P1-L10),
+    """CIK path: a real company no checked report lists is `not_a_bdc_cik` (P1-L10),
     matching the accession path's NOT_A_BDC."""
     from edgar.bdc.reference import lookup_bdc
 
@@ -255,12 +258,57 @@ def _bdc_not_found_response(identifier: str) -> Any:
     )
 
 
+def _report_years_checked() -> Optional[list[int]]:
+    """The SEC BDC Report years `lookup_bdc` could read, oldest first, or `None`
+    when that is unknown.
+
+    Walks the same years as `lookup_bdc` (the latest plus
+    `_BDC_LOOKBACK_YEARS`), keeping only those whose report loaded. Those
+    reports were just read by the failed lookup, so these are
+    `fetch_bdc_report` cache hits, not new downloads.
+    """
+    from edgar.bdc.reference import fetch_bdc_report, get_latest_bdc_report_year
+
+    try:
+        latest = get_latest_bdc_report_year()
+    except Exception as exc:
+        logger.warning("Could not determine the latest BDC report year: %s", exc)
+        return None
+    years = []
+    for year in range(latest - _BDC_LOOKBACK_YEARS, latest + 1):
+        try:
+            fetch_bdc_report(year)
+        except Exception as exc:
+            logger.debug("BDC report %s unavailable: %s", year, exc)
+            continue
+        years.append(year)
+    return years or None
+
+
+def _years_text(years: list[int]) -> str:
+    """`[2024, 2025, 2026]` -> "2024, 2025 and 2026"."""
+    names = [str(year) for year in years]
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
 def _not_a_bdc_response(cik: Any) -> Any:
+    """NOT_A_BDC, worded as what is known (final review I3).
+
+    The evidence is only that no checked SEC BDC Report lists the CIK. That
+    report omits real, filing BDCs (Sixth Street Specialty Lending, CIK
+    1508655, is absent from 2024-2026), so the message must not claim the
+    entity is not a BDC. The code stays NOT_A_BDC for existing callers.
+    """
+    years = _report_years_checked()
+    where = f"for {_years_text(years)}" if years else "years checked"
     return error(
-        f"CIK {cik} is not a Business Development Company.",
+        f"CIK {cik} is not listed in the SEC BDC Report {where}. That report omits some BDCs, "
+        f"so this does not establish whether CIK {cik} is a Business Development Company.",
         suggestions=[
-            "Use action='bdc_search' to find BDCs by name or ticker",
-            "Provide a BDC identifier instead of accession_number alone",
+            "The SEC BDC Report omits some BDCs; edgar_fund's BDC actions only cover BDCs it lists",
+            "To read this company's holdings anyway, open the Schedule of Investments in its "
+            "10-K/10-Q with edgar_read or edgar_document",
+            "Use action='bdc_search' to find BDCs the report lists, by name or ticker",
         ],
         error_code="NOT_A_BDC",
     )
@@ -376,8 +424,8 @@ def resolve_bdc_and_filing(
 
     Returns a `BdcResolution` on success, or a `ToolResponse` the caller
     should return as-is: `COMPANY_NOT_FOUND`/`AMBIGUOUS_BDC`/`NOT_A_BDC` for
-    an unresolved identifier, `NOT_A_BDC` when an accession's CIK isn't a
-    BDC in any checked report year, or a filing-selection failure's own
+    an unresolved identifier, `NOT_A_BDC` when an accession's CIK is not
+    listed in any checked SEC BDC Report year, or a filing-selection failure's own
     response (including `SELECTION_MISMATCH` when `identifier` and
     `accession_number` name different companies).
     """

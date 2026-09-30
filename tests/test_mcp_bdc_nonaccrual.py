@@ -33,7 +33,13 @@ from edgar.ai.mcp.tools.fund import edgar_fund
 from edgar.ai.mcp.tools.selection import FilingSelection
 from edgar.bdc.nonaccrual import NonAccrualInvestment, NonAccrualResult
 
-from tests.test_mcp_bdc_portfolio import _FakeBDC, _FakeFiling, _patch_bdc, _patch_selection
+from tests.test_mcp_bdc_portfolio import (
+    _FakeBDC,
+    _FakeFiling,
+    _patch_bdc,
+    _patch_selection,
+    newest_report_year_listing,
+)
 
 
 # =============================================================================
@@ -632,8 +638,6 @@ class TestBdcNonaccrualARCCLive:
     """
 
     async def test_period_selects_ground_truth_filing_and_footnote_evidence(self):
-        from edgar.bdc.reference import lookup_bdc
-
         set_identity("Test User test@test.com")
 
         response = await edgar_fund(
@@ -647,15 +651,13 @@ class TestBdcNonaccrualARCCLive:
         assert response.data["warnings"] == []
         assert response.data["source"]["accession_number"] == ARCC_10Q_ACCESSION
         assert response.data["cik"] == ARCC_CIK
-        # P1-M5: is_active comes from ARCC's own latest filing, not a
-        # possibly-stale report row. Which report year ARCC actually
-        # resolves through drifts as SEC republishes the BDC Report
-        # annually (it was missing from the 2026 report as of 2026-09-29),
-        # so the expected year is computed here via the same `lookup_bdc`
-        # lookback the code path itself uses, not hard-coded.
-        expected_year = lookup_bdc(cik=ARCC_CIK).report_year
-        assert isinstance(expected_year, int) and expected_year >= 2025
-        assert response.data["bdc_report_year"] == expected_year
+        # P1-M5 / final review I1: `bdc_report_year` is the report ARCC's row
+        # actually came from (it drifts as SEC republishes the BDC Report;
+        # ARCC was absent from the 2026 report as of 2026-09-30). The expected
+        # year comes from an independent oracle that reads each year's CSV
+        # directly, never from `lookup_bdc`, the code under test. is_active
+        # comes from ARCC's own latest filing, not a possibly-stale row.
+        assert response.data["bdc_report_year"] == newest_report_year_listing(ARCC_CIK)
         assert response.data["is_active"] is True
 
     async def test_hand_verified_investment_identifier_and_footnote(self):

@@ -393,8 +393,10 @@ Full-text search across SEC filing content.
 Get fund, ETF, BDC, and money market fund data, including BDC portfolio
 holdings and non-accrual evidence. A `cursor` alone continues a `bdc_portfolio`
 or `bdc_nonaccrual` page. A BDC name that does not identify exactly one BDC
-returns `AMBIGUOUS_BDC` with candidates. A count or total the evidence does
-not establish is `null`, never `0`.
+returns `AMBIGUOUS_BDC` with candidates. A company that no checked SEC BDC
+Report year lists returns `NOT_A_BDC`, naming the years checked; that report
+omits some BDCs, so the code means "not listed", not "not a BDC". A count or
+total the evidence does not establish is `null`, never `0`.
 
 **Example prompts:**
 - "Look up the Vanguard 500 Index Fund"

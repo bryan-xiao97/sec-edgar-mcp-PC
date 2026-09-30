@@ -8,11 +8,12 @@ Data source: https://www.sec.gov/data-research/sec-markets-data/opendatasetsshtm
 """
 import logging
 import io
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from functools import lru_cache
-from typing import Optional
+from typing import Callable, Optional
 from rich import box
 from rich.panel import Panel
 from rich.table import Table
@@ -548,33 +549,81 @@ def _excel_serial_to_date(serial: float) -> Optional[date]:
         return None
 
 
-@lru_cache(maxsize=1)
+#: How long a confirmed latest report year is reused before SEC is probed
+#: again: the probe is not repeated per call, and a long-running process (an
+#: MCP server) still sees a newly published report within a day.
+LATEST_REPORT_YEAR_TTL_SECONDS = 24 * 60 * 60
+
+
+class _ConfirmedYearCache:
+    """The latest BDC report year, remembered only once confirmed and only for a TTL.
+
+    An ``lru_cache`` here pinned whatever the first probe returned for the life
+    of the process, so a single timeout on the current year's probe made last
+    year "the latest" until restart. `clock` is injectable for tests.
+    """
+
+    def __init__(self, ttl_seconds: float, clock: Callable[[], float] = time.monotonic):
+        self.ttl_seconds = ttl_seconds
+        self.clock = clock
+        self._entry: Optional[tuple[int, float]] = None  # (year, expires_at)
+
+    def get(self) -> Optional[int]:
+        entry = self._entry
+        if entry is None or self.clock() >= entry[1]:
+            return None
+        return entry[0]
+
+    def put(self, year: int) -> None:
+        self._entry = (year, self.clock() + self.ttl_seconds)
+
+    def clear(self) -> None:
+        self._entry = None
+
+
+_latest_year_cache = _ConfirmedYearCache(LATEST_REPORT_YEAR_TTL_SECONDS)
+
+
 def get_latest_bdc_report_year() -> int:
     """
     Determine the latest available year for the SEC BDC Report.
 
-    Checks backwards from the current year to find available reports.
-    Cached for the life of the process (``lru_cache``): every probe hits SEC,
-    so an uncached call here meant `lookup_bdc` (and anything else that calls
-    this directly rather than through `fetch_bdc_report`'s own cache) issued
-    a fresh round of HTTP probes on every call. Tests that need a fresh probe
-    per call must clear the cache themselves (``get_latest_bdc_report_year.
-    cache_clear()``).
+    Checks backwards from the current year to find available reports. A year
+    is cached for `LATEST_REPORT_YEAR_TTL_SECONDS` only when it is confirmed:
+    its CSV answered 200 and every newer year answered 404. A newer year that
+    timed out or answered anything else might exist, so that answer (and the
+    fallback year) is returned for this call but not remembered, and the next
+    call probes again. `get_latest_bdc_report_year.cache_clear()` forgets the
+    cached year.
 
     Returns:
         The latest year with an available BDC report.
     """
+    cached = _latest_year_cache.get()
+    if cached is not None:
+        return cached
+    year, confirmed = _probe_latest_bdc_report_year()
+    if confirmed:
+        _latest_year_cache.put(year)
+    return year
+
+
+get_latest_bdc_report_year.cache_clear = _latest_year_cache.clear
+
+
+def _probe_latest_bdc_report_year() -> tuple[int, bool]:
+    """``(year, confirmed)``: the newest year whose report answered 200, and
+    whether every newer year definitively answered 404."""
     current_year = datetime.now().year
     unreachable = 0
     probed = 0
+    newer_year_unanswered = False
 
     for year in range(current_year, 2015, -1):
         url = f"{BDC_REPORT_BASE_URL}/business-development-company-{year}.csv"
         probed += 1
         try:
             response = get_with_retry(url, timeout=5)
-            if response.status_code == 200:
-                return year
         except Exception as e:
             # A missing year is a 404, which returns a response rather than
             # raising, so it never reaches here — reaching here means the probe
@@ -582,6 +631,7 @@ def get_latest_bdc_report_year() -> int:
             # report for this year" from "we could not ask", which is the whole
             # difference between the fallback below being a reasonable default
             # and being a fabricated claim about what the latest year is.
+            newer_year_unanswered = True
             if is_unreachable(e):
                 unreachable += 1
             else:
@@ -590,6 +640,13 @@ def get_latest_bdc_report_year() -> int:
                     year, type(e).__name__, e,
                 )
             continue
+        if response.status_code == 200:
+            if newer_year_unanswered:
+                log.info("Using the %s BDC report for now; a newer year could not be checked "
+                         "and will be probed again on the next call.", year)
+            return year, not newer_year_unanswered
+        if response.status_code != 404:
+            newer_year_unanswered = True
 
     # Reaching here means no year answered 200. Say so rather than presenting a
     # hardcoded year as though it had been confirmed: if SEC moves
@@ -606,7 +663,7 @@ def get_latest_bdc_report_year() -> int:
             "This usually means the report moved — check %s.",
             current_year, _BDC_REPORT_FALLBACK_YEAR, BDC_REPORT_BASE_URL,
         )
-    return _BDC_REPORT_FALLBACK_YEAR
+    return _BDC_REPORT_FALLBACK_YEAR, False
 
 
 @lru_cache(maxsize=4)
@@ -823,12 +880,11 @@ def lookup_bdc(
     The SEC's annual BDC Report can omit an active BDC from a given year's
     snapshot even though the company is still an active, filing BDC:
     measured 2026-09-28, Ares Capital Corp (CIK 1287750) is present in the
-    2024 and 2025 reports but missing from the 2026 one. `is_bdc_cik()` and
-    a bare `get_bdc_list().get_by_cik()`/`get_by_ticker()` only ever consult
-    the latest report, so both silently say "not a BDC" for an entity like
-    that. This checks the latest report first, then up to `lookback_years`
-    prior years, returning the first match -- so "dropped from the latest
-    snapshot" is not treated the same as "not a BDC".
+    2024 and 2025 reports but missing from the 2026 one. This checks the
+    latest report first, then up to `lookback_years` prior years, each by its
+    explicit year, returning the first match -- so "dropped from the latest
+    snapshot" is not treated the same as "not a BDC", and the match says
+    which report it came from.
 
     Args:
         cik: SEC CIK number to look up.
@@ -843,8 +899,8 @@ def lookup_bdc(
     Returns:
         The first matching BDCEntity, or None if not found in the latest
         report or any of the lookback years. The match carries an additive
-        `report_year` attribute set to the report year it was found in, so a
-        caller (e.g. `is_active`, Task Q2) can tell a latest-year hit from a
+        `report_year` attribute set to the report year its row came from, so
+        a caller (e.g. `is_active`, Task Q2) can tell a latest-year hit from a
         lookback hit.
 
     Raises:
@@ -859,11 +915,13 @@ def lookup_bdc(
     latest_year = get_latest_bdc_report_year()
     for year in range(latest_year, latest_year - lookback_years - 1, -1):
         try:
-            # The latest year uses the bare get_bdc_list() (year=None) so it
-            # shares fetch_bdc_report's lru_cache entry with every other bare
-            # caller (is_bdc_cik, get_active_bdc_ciks, ...) instead of
-            # fetching the identical CSV again under a second cache key.
-            bdcs = get_bdc_list(None if year == latest_year else year)
+            # Always the exact year, never the bare get_bdc_list(): that is the
+            # union of recent reports (GH #1146), so a row found there can come
+            # from an older report than `year`, and labelling it `year` made a
+            # stale row look current (final review I1). This costs no extra
+            # download: the union fetches every year under this same
+            # fetch_bdc_report(year) cache key.
+            bdcs = get_bdc_list(year)
         except Exception as e:
             log.warning(
                 "Could not fetch the %d BDC report while looking up a BDC (%s: %s); skipping.",

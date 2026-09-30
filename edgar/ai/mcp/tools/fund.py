@@ -58,7 +58,7 @@ def _df_to_records(df: pd.DataFrame, limit: int, columns: Optional[list[str]] = 
 
 Actions: lookup (find fund by ticker/CIK), search (by name), portfolio (NPORT holdings), money_market (yields/NAV), bdc_search, bdc_portfolio, bdc_nonaccrual.
 
-BDC identity blocks report bdc_report_year (the SEC BDC Report year the BDC was matched in; null when unknown). A count or total the evidence does not establish (e.g. bdc_nonaccrual's num_nonaccrual without per-investment detail) is null, never 0. An identifier that does not resolve to exactly one BDC returns AMBIGUOUS_BDC with candidates -- an exact case-insensitive name match wins even among similarly-named siblings; otherwise the top fuzzy match needs a score >= 95 with the runner-up < 90 to auto-resolve.
+BDC identity blocks report bdc_report_year (the SEC BDC Report year the BDC's row came from; null when unknown). When that row is from an older report than the latest, is_active comes from the company's own latest filing. A count or total the evidence does not establish (e.g. bdc_nonaccrual's num_nonaccrual without per-investment detail) is null, never 0. An identifier that does not resolve to exactly one BDC returns AMBIGUOUS_BDC with candidates -- an exact case-insensitive name match wins even among similarly-named siblings; otherwise the top fuzzy match needs a score >= 95 with the runner-up < 90 to auto-resolve. A company that no checked SEC BDC Report year lists returns NOT_A_BDC, naming the years checked; that report omits some BDCs, so NOT_A_BDC means "not listed", not "not a BDC".
 
 Examples:
 - Fund lookup: action="lookup", identifier="VFINX"
