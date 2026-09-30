@@ -58,6 +58,8 @@ def _df_to_records(df: pd.DataFrame, limit: int, columns: Optional[list[str]] = 
 
 Actions: lookup (find fund by ticker/CIK), search (by name), portfolio (NPORT holdings), money_market (yields/NAV), bdc_search, bdc_portfolio, bdc_nonaccrual.
 
+BDC identity blocks report bdc_report_year (the SEC BDC Report year the BDC was matched in; null when unknown). A count or total the evidence does not establish (e.g. bdc_nonaccrual's num_nonaccrual without per-investment detail) is null, never 0. An identifier that does not resolve to exactly one BDC returns AMBIGUOUS_BDC with candidates -- an exact case-insensitive name match wins even among similarly-named siblings; otherwise the top fuzzy match needs a score >= 95 with the runner-up < 90 to auto-resolve.
+
 Examples:
 - Fund lookup: action="lookup", identifier="VFINX"
 - Fund search: action="search", query="Vanguard 500"
@@ -68,8 +70,7 @@ Examples:
 - BDC portfolio (chosen period): action="bdc_portfolio", identifier="ARCC", form="10-Q", period="2026-06-30"
 - BDC portfolio (chosen filing by accession): action="bdc_portfolio", accession_number="0001628280-26-050307"
 - BDC portfolio (borrower filter): action="bdc_portfolio", identifier="ARCC", form="10-Q", period="2026-06-30", borrower="Ivy Hill"
-- BDC portfolio (next page): action="bdc_portfolio", identifier="ARCC", form="10-Q", period="2026-06-30", borrower="Ivy Hill", cursor="<page.next_cursor from the previous call>"
-- BDC portfolio (next page, cursor alone): action="bdc_portfolio", cursor="<page.next_cursor from the previous call>"
+- BDC portfolio (next page, cursor alone -- identifier/form/period/borrower are optional and default to the cursor's own values): action="bdc_portfolio", cursor="<page.next_cursor from the previous call>"
 - BDC non-accrual evidence: action="bdc_nonaccrual", identifier="ARCC", form="10-Q", period="2026-06-30"
 
 <!-- MCP_TOOL_CALL_EXAMPLE -->
@@ -79,7 +80,7 @@ Examples:
 
 <!-- MCP_TOOL_CALL_EXAMPLE -->
 ```json
-{"tool":"edgar_fund","arguments":{"action":"bdc_portfolio","identifier":"ARCC","form":"10-Q","period":"2026-06-30","borrower":"Ivy Hill","limit":20,"cursor":"<page.next_cursor>"}}
+{"tool":"edgar_fund","arguments":{"action":"bdc_portfolio","cursor":"<page.next_cursor>"}}
 ```""",
     params={
         "action": {

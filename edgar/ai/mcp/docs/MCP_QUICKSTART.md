@@ -301,7 +301,8 @@ Examine any SEC filing by accession number or URL.
 - `detail`: `minimal`, `standard` (default), or `full`
 
 #### 4. edgar_read
-Read specific sections from a filing.
+Read specific sections from a filing. An amendment (`/A` suffix) is reachable
+only by `accession_number`. A `cursor` alone continues a truncated section.
 
 **Example prompts:**
 - "Show me the risk factors from Apple's latest 10-K"
@@ -311,6 +312,7 @@ Read specific sections from a filing.
 - `accession_number`: SEC accession number
 - OR `identifier` + `form`: Company + form type
 - `sections`: `summary`, `business`, `risk_factors`, `mda`, `financials`, or `all`
+- `cursor`: Continuation cursor from a truncated section's `next_cursor`; alone is enough
 
 #### 5. edgar_compare
 Compare companies side-by-side or analyze an industry.
@@ -388,7 +390,11 @@ Full-text search across SEC filing content.
 - `start_date`: Start date filter
 
 #### 11. edgar_fund
-Get fund, ETF, BDC, and money market fund data.
+Get fund, ETF, BDC, and money market fund data, including BDC portfolio
+holdings and non-accrual evidence. A `cursor` alone continues a `bdc_portfolio`
+or `bdc_nonaccrual` page. A BDC name that does not identify exactly one BDC
+returns `AMBIGUOUS_BDC` with candidates. A count or total the evidence does
+not establish is `null`, never `0`.
 
 **Example prompts:**
 - "Look up the Vanguard 500 Index Fund"
@@ -396,10 +402,11 @@ Get fund, ETF, BDC, and money market fund data.
 - "What money market funds does Vanguard offer?"
 
 **Parameters:**
-- `action` (required): `lookup`, `search`, `portfolio`, `money_market`, `bdc_search`, or `bdc_portfolio`
-- `identifier`: Fund ticker, series ID, or CIK
+- `action` (required): `lookup`, `search`, `portfolio`, `money_market`, `bdc_search`, `bdc_portfolio`, or `bdc_nonaccrual`
+- `identifier`: Fund ticker, series ID, or CIK (BDC actions also accept a BDC name)
 - `query`: Search text for fund or BDC name
 - `limit` (default: 20): Max results
+- `cursor`: Continuation cursor; alone is enough to fetch the next `bdc_portfolio`/`bdc_nonaccrual` page
 
 #### 12. edgar_proxy
 Get executive compensation and governance data from DEF 14A proxy statements.
@@ -414,6 +421,8 @@ Get executive compensation and governance data from DEF 14A proxy statements.
 
 #### 13. edgar_notes
 Drill into financial statement notes and disclosures — the detail behind the numbers.
+An amendment (`/A` suffix) is reachable only by `accession_number`. A `cursor`
+alone continues a truncated table or note context.
 
 **Example prompts:**
 - "Show me Apple's revenue recognition policy"
@@ -424,6 +433,7 @@ Drill into financial statement notes and disclosures — the detail behind the n
 - `topic`: Note topic to search for (e.g., "revenue", "debt", "leases", "contingencies"). Omit for table of contents.
 - `form` (default: "10-K"): Filing form type. Use "10-Q" for quarterly notes.
 - `detail` (default: "standard"): `minimal` (titles only), `standard` (context + tables), or `full` (includes DataFrame data)
+- `cursor`: Continuation cursor from a table's or note context's `next_cursor`; alone is enough
 
 #### 14. edgar_document
 List, search and read exact documents attached to a filing. Select a document
@@ -469,7 +479,7 @@ matched, so no match is not proof that a term is absent.
 
 <!-- MCP_TOOL_CALL_EXAMPLE -->
 ```json
-{"tool":"edgar_document","arguments":{"action":"read","accession_number":"0001628280-26-050307","document":"[exact-filename-from-list]","cursor":"<page.next_cursor>"}}
+{"tool":"edgar_document","arguments":{"action":"read","cursor":"<page.next_cursor>"}}
 ```
 
 <!-- MCP_TOOL_CALL_EXAMPLE -->

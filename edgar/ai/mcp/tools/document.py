@@ -509,7 +509,7 @@ _EXAMPLE = "<!-- MCP_TOOL_CALL_EXAMPLE -->\n```json\n{}\n```"
             '{"tool":"edgar_document","arguments":{"action":"list","accession_number":"0001628280-26-050307"}}',
             '{"tool":"edgar_document","arguments":{"action":"search","accession_number":"0001628280-26-050307","document":"[exact-filename-from-list]","query":"loan agreement"}}',
             '{"tool":"edgar_document","arguments":{"action":"read","accession_number":"0001628280-26-050307","document":"[exact-filename-from-list]"}}',
-            '{"tool":"edgar_document","arguments":{"action":"read","accession_number":"0001628280-26-050307","document":"[exact-filename-from-list]","cursor":"<page.next_cursor>"}}',
+            '{"tool":"edgar_document","arguments":{"action":"read","cursor":"<page.next_cursor>"}}',
             '{"tool":"edgar_document","arguments":{"action":"read","url":"https://www.sec.gov/Archives/edgar/data/320193/000032019325000073/a10-qexhibit32106282025.htm"}}',
         ))
     ),
@@ -525,7 +525,9 @@ _EXAMPLE = "<!-- MCP_TOOL_CALL_EXAMPLE -->\n```json\n{}\n```"
         "query": {
             "type": "string",
             "description": "Text or regular expression to search within filing documents. With a cursor, "
-                           "defaults to the cursor's query when the cursor carries it.",
+                           "defaults to the cursor's query when the cursor carries it. A query too long to "
+                           "embed in the cursor is represented there only by a hash; the cursor then "
+                           "requires this call to resend the same query, else QUERY_REQUIRED.",
         },
         "regex": {
             "type": "boolean",

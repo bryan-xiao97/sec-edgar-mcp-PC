@@ -444,7 +444,7 @@ Examples:
 
 <!-- MCP_TOOL_CALL_EXAMPLE -->
 ```json
-{"tool":"edgar_notes","arguments":{"topic":"debt","identifier":"ARCC","form":"10-Q","period":"2026-06-30","detail":"standard","limit":20,"cursor":"<table-or-context.next_cursor>"}}
+{"tool":"edgar_notes","arguments":{"cursor":"<table-or-context.next_cursor>"}}
 ```""",
     params={
         "identifier": {
@@ -457,7 +457,8 @@ Examples:
         },
         "form": {
             "type": "string",
-            "description": "Filing form type (default: 10-K). Use 10-Q for quarterly notes.",
+            "description": "Filing form type (default: 10-K). Use 10-Q for quarterly notes. An "
+                           "amendment ('/A' suffix) is reachable only by accession_number.",
             "default": "10-K"
         },
         "detail": {

@@ -126,7 +126,7 @@ Examples:
 
 <!-- MCP_TOOL_CALL_EXAMPLE -->
 ```json
-{"tool":"edgar_read","arguments":{"identifier":"ARCC","form":"10-Q","period":"2026-06-30","sections":["mda"],"cursor":"<section_pages.mda.next_cursor>"}}
+{"tool":"edgar_read","arguments":{"cursor":"<section_pages.mda.next_cursor>"}}
 ```""",
     params={
         "accession_number": {
@@ -140,7 +140,9 @@ Examples:
         "form": {
             "type": "string",
             "description": "Form type (used with identifier to get most recent, or with period to select "
-                           "the exact filing). Required whenever identifier is given."
+                           "the exact filing). Required whenever identifier is given. An amendment "
+                           "('/A' suffix, e.g. '10-K/A') is reachable only by accession_number, not by "
+                           "identifier+form or period."
         },
         "period": {
             "type": "string",

@@ -152,7 +152,7 @@ def _render_borrower_credit_review(
 
 3. **Retrieve non-accrual evidence**: Use edgar_fund action="bdc_nonaccrual" for the SAME accession number. This action returns filing-wide evidence; follow all investment evidence pages and identify any records relevant to the borrower from their reported names. Preserve supporting footnotes, evidence level, extraction method and warnings. Portfolio-level totals cannot establish an individual borrower's status. Non-accrual is an accounting status, not a legal default determination.
 
-4. **Read supporting disclosures**: Use edgar_notes and edgar_read with that same accession number for relevant valuation, liquidity, payment and restructuring disclosures. Discover available notes/sections before selecting them. Follow relevant text and table pages beyond previews. For every continuation call, repeat the original selector and filters with the returned cursor. If evidence changes and a cursor becomes stale, restart that retrieval and report the issue.
+4. **Read supporting disclosures**: Use edgar_notes and edgar_read with that same accession number for relevant valuation, liquidity, payment and restructuring disclosures. Discover available notes/sections before selecting them. Follow relevant text and table pages beyond previews. For every continuation call, pass back the returned cursor alone; it carries its own filing, topic/detail and section identity. If evidence changes and a cursor becomes stale, restart that retrieval and report the issue.
 
 5. **Period context**: {comparison}
 
@@ -182,7 +182,7 @@ def _render_lender_protection_review(
 
 3. **Search each relevant document**: Use edgar_document action="search" with the accession_number and exact document filename, searching for the requested topics and related wording. For example, search for collateral, security interest, guarantor, subordination, intercreditor, release and remedies. Preserve each match's document-bound locator. A missing keyword match does not prove that a protection is absent.
 
-4. **Read provisions in context**: Use edgar_document action="read" with the SAME accession and document selector and around set to the returned locator. Read headings, defined terms, exceptions, schedules and referenced sections needed to understand the passage. Continue relevant long documents with next_cursor, repeating the exact document selector; do not combine around and cursor. Search and read amendments for changes to the relevant provisions. Report unreadable content and unavailable referenced documents explicitly.
+4. **Read provisions in context**: Use edgar_document action="read" with the SAME accession and document selector and around set to the returned locator. Read headings, defined terms, exceptions, schedules and referenced sections needed to understand the passage. Continue relevant long documents by passing back next_cursor alone; do not combine around and cursor. Search and read amendments for changes to the relevant provisions. Report unreadable content and unavailable referenced documents explicitly.
 
 5. **Report the evidence**: Provide a document inventory and a table of topic, source passage, plain-language explanation, qualifications and citation. Cite exact documents and locators and identify the parties and obligations each passage covers. Include relevant financial notes using edgar_notes or edgar_read from the selected filing when useful.
 
