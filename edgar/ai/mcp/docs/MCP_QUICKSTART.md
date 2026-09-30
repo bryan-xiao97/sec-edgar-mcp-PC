@@ -442,11 +442,17 @@ report a portfolio borrower without containing that borrower's own agreement.
 Search skips text it could not read and says so: searching an unreadable
 document (PDF, image, paper, empty) returns `unreadable_reason`, and an
 all-documents search lists skipped attachments in `unsearched_documents`.
-Queries match the text as a reader sees it, ignoring markdown backslash escapes
-(`15\(d\)` matches `15(d)`); `match` and `context` are verbatim slices of the
-rendered text `read` returns, and `match_text` is the unescaped match. Matching
-is case-insensitive but otherwise exact: whitespace, line breaks and table-cell
-boundaries are not normalized, so no match is not proof that a term is absent.
+Queries match the text as a reader sees it: markdown backslash escapes are
+ignored (`15\(d\)` matches `15(d)`), and in a literal query any run of spaces,
+tabs or line breaks matches any other run (`net asset value` matches
+`Net\nasset value`). A literal match crosses a table-cell boundary (`|`) only if
+the query contains `|`.
+Regex queries keep their own whitespace semantics; use `\s+` to tolerate line
+wrapping. `match` and `context` are verbatim slices of the rendered text `read`
+returns; `match_text` is the match as searched (unescaped, and with whitespace
+collapsed for literal queries). Matching is case-insensitive; other variations
+(different wording or hyphenation, text split across table cells) are not
+matched, so no match is not proof that a term is absent.
 `list` hides XBRL files, generated R pages and XBRL viewer files unless
 `include_all` is true. A `cursor` alone continues a list, search or read.
 `source.selected_by` is `"url"` when a URL chose the filing.

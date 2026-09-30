@@ -543,12 +543,6 @@ _ESCAPED_BODY = (
 )
 
 
-def _reader_view(rendered: str) -> str:
-    import re
-
-    return re.sub(r"\\([!-/:-@\[-`{-~])", r"\1", rendered)
-
-
 @pytest.fixture
 def escaped_exhibit(filing):
     exhibit = filing._test_attachments[2]  # agreement-a.htm, EX-10.1
@@ -599,32 +593,3 @@ async def test_regex_search_matches_escaped_markdown_at_rendered_offsets(escaped
     for m in matches:
         offset = m["locator"]["char_offset"]
         assert _ESCAPED_BODY[offset:offset + len(m["match"])] == m["match"]
-
-
-@pytest.mark.fast
-def test_unescaped_offsets_are_exact_under_unicode_fuzz():
-    import random
-
-    from edgar.ai.mcp.tools.document_search import rendered_matches, unescaped_view
-    from edgar.search.grep import _grep_text
-
-    alphabet = ["a", "b", "İ", "ı", "σ", "ς", "Σ", "e\u0307", "(", ")", "-", ".", "\\", "*", " ", "\n", "x"]
-    escape = set("\\`*_{}[]()#+-.!")
-    rng = random.Random(20260929)  # noqa: S311 -- deterministic fuzz seed, not cryptography
-    checked = 0
-    for _ in range(2_000):
-        original = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 60)))
-        rendered = "".join("\\" + ch if ch in escape else ch for ch in original)
-        assert unescaped_view(rendered)[0] == original
-        start = rng.randrange(len(original))
-        query = original[start:start + rng.randint(1, 6)]
-        oracle = _grep_text(original, query, "doc")
-        records = rendered_matches(rendered, query, False, "doc.htm", "doc", remaining=10_000)
-        assert len(records) == len(oracle)
-        for record, expected in zip(records, oracle, strict=True):
-            offset = record["locator"]["char_offset"]
-            assert rendered[offset:offset + len(record["match"])] == record["match"]
-            assert len(_reader_view(rendered[:offset])) == expected.char_offset
-            assert _reader_view(record["match"]) == expected.match == record["match_text"]
-            checked += 1
-    assert checked > 2_000

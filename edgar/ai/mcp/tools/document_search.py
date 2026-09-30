@@ -7,14 +7,28 @@ be read is reported in ``unsearched_documents`` rather than silently counted
 as "no matches" (QA finding P2-H1).
 
 That text is rendered markdown, which backslash-escapes punctuation
-(``Sarbanes\\-Oxley``, ``15\\(d\\)``, ``U\\.S\\.``). Matching it directly misses
-body text a reader plainly sees (Q4 review finding I1), so the query runs
-against an unescaped *view* of the rendered text. The view drops each
-escaping backslash and remembers where; a view offset ``x`` maps back to the
-rendered offset ``x + (number of dropped backslashes before x)``, which is
-exact at both ends of a match. Locators, ``match`` and ``context`` are
-therefore verbatim slices of the text ``read`` pages; ``match_text`` is the
-match as a reader sees it.
+(``Sarbanes\\-Oxley``, ``15\\(d\\)``, ``U\\.S\\.``) and wraps lines. Matching it
+directly misses body text a reader plainly sees (Q4 review findings I1 and
+Gap A), so queries run against a *reader view* of the rendered text:
+
+- Escapes are removed exactly where ``edgar.documents``' renderer adds them:
+  the characters ``\\ ` * _ { } [ ] ( ) # + - . !`` outside markdown table rows.
+  Table rows are never escaped by the renderer, so a backslash there is real
+  (Gap B).
+- For literal queries, every run of whitespace (spaces, tabs, newlines,
+  non-breaking spaces) becomes one space, and so does every run in the
+  query. ``|`` is not whitespace, so a literal match never spans a table-cell
+  boundary unless the query itself contains ``|``.
+- Regex queries keep their own semantics: they see the unescaped text with
+  its whitespace intact (``\\s+`` is how a regex tolerates wrapping).
+
+A view character stands for one rendered span (a character, a backslash
+plus the character it escapes, or a whole whitespace run). Spans are
+contiguous, so a view offset ``x`` maps back to the rendered offset
+``x + (extra rendered characters of the spans before x)``, which is exact at
+both ends of a match. Locators, ``match`` and ``context`` are therefore
+verbatim slices of the text ``read`` pages; ``match_text`` is the match as
+the view shows it.
 """
 
 from __future__ import annotations
@@ -22,8 +36,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from bisect import bisect_left
-from typing import Any, Optional
+from bisect import bisect_left, bisect_right
+from typing import Any, NamedTuple, Optional
 
 from edgar.ai.mcp.tools.continuation import fingerprint
 from edgar.ai.mcp.tools.document_identity import library_version, read_text
@@ -33,9 +47,13 @@ MAX_SEARCH_MATCHES = 1_000
 MAX_SEARCH_MATCH_CHARS = 2_048
 REGEX_TIMEOUT_SECONDS = 0.05
 CONTEXT_CHARS = 100
-# CommonMark backslash escape: a backslash before any ASCII punctuation.
-# edgar.documents' renderer escapes a subset of these outside tables.
-_MARKDOWN_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
+# Exactly what edgar.documents' markdown renderer escapes (``_escape_markdown``),
+# which it never applies inside tables.
+_ESCAPE = r"\\[\\`*_{}\[\]()#+\-.!]"
+_ESCAPE_TOKEN = re.compile(_ESCAPE)
+_ESCAPE_OR_WHITESPACE_TOKEN = re.compile(_ESCAPE + r"|\s{2,}|[^\S ]")
+_TABLE_ROW = re.compile(r"^[ \t]*\|[^\n]*", re.MULTILINE)
+_WHITESPACE_RUN = re.compile(r"\s+")
 
 
 class SearchOverflowError(Exception):
@@ -89,34 +107,63 @@ def _unsearched(attachment, reason: str) -> dict[str, Any]:
     }
 
 
-def unescaped_view(text: str) -> tuple[str, list[int]]:
-    """``(view, escapes)``: ``text`` without markdown escaping backslashes.
+class ReaderView(NamedTuple):
+    """Rendered text as a reader sees it, with a sparse map back to the rendered text.
 
-    ``escapes`` lists, in ascending order, the view index of every character
-    whose escaping backslash was dropped. ``to_rendered_offset`` uses it to
-    map a view offset back to ``text``.
+    ``anchors`` lists, ascending, the view index of every character whose
+    rendered span is longer than one character; ``extra`` holds the running
+    total of those extra rendered characters through each anchor.
     """
-    escapes: list[int] = []
+
+    text: str
+    anchors: list[int]
+    extra: list[int]
+
+    def to_rendered(self, view_offset: int) -> int:
+        """The rendered offset of a view boundary (the start of the span at ``view_offset``)."""
+        k = bisect_left(self.anchors, view_offset)
+        return view_offset + (self.extra[k - 1] if k else 0)
+
+
+def _table_rows(text: str) -> tuple[list[int], list[int]]:
+    rows = [(m.start(), m.end()) for m in _TABLE_ROW.finditer(text)]
+    return [start for start, _ in rows], [end for _, end in rows]
+
+
+def _in_table_row(position: int, starts: list[int], ends: list[int]) -> bool:
+    k = bisect_right(starts, position) - 1
+    return k >= 0 and position < ends[k]
+
+
+def reader_view(text: str, collapse_whitespace: bool) -> ReaderView:
+    """The reader view of rendered ``text`` (see the module docstring)."""
+    token = _ESCAPE_OR_WHITESPACE_TOKEN if collapse_whitespace else _ESCAPE_TOKEN
+    starts, ends = _table_rows(text)
     parts: list[str] = []
+    anchors: list[int] = []
+    extra: list[int] = []
+    view_length = 0
     last = 0
-    for match in _MARKDOWN_ESCAPE.finditer(text):
+    for match in token.finditer(text):
+        span = match.group()
+        if span[0] == "\\":
+            if _in_table_row(match.start(), starts, ends):
+                continue  # the renderer never escapes tables: this backslash is text
+            replacement = span[1]
+        else:
+            replacement = " "
         parts.append(text[last:match.start()])
-        escapes.append(match.start() - len(escapes))
-        last = match.start() + 1  # keep the escaped character, drop the backslash
-    if not escapes:
-        return text, escapes
+        view_length += match.start() - last
+        parts.append(replacement)
+        if len(span) > 1:
+            anchors.append(view_length)
+            extra.append((extra[-1] if extra else 0) + len(span) - 1)
+        view_length += 1
+        last = match.end()
+    if not parts:
+        return ReaderView(text, anchors, extra)
     parts.append(text[last:])
-    return "".join(parts), escapes
-
-
-def to_rendered_offset(view_offset: int, escapes: list[int]) -> int:
-    """The rendered offset of a view boundary.
-
-    Every escape before ``view_offset`` adds one backslash. An escaped
-    character at ``view_offset`` itself starts at its backslash, so a match
-    beginning there includes it, and a match ending just before it excludes it.
-    """
-    return view_offset + bisect_left(escapes, view_offset)
+    return ReaderView("".join(parts), anchors, extra)
 
 
 def _context(text: str, start: int, end: int) -> str:
@@ -131,11 +178,12 @@ def _context(text: str, start: int, end: int) -> str:
 
 
 def rendered_matches(text: str, query: str, regex: bool, filename: str, location: str, remaining: int) -> list:
-    """Match records for one document's rendered ``text``, matched through its unescaped view."""
-    view, escapes = unescaped_view(text)
+    """Match records for one document's rendered ``text``, matched through its reader view."""
+    view = reader_view(text, collapse_whitespace=not regex)
+    pattern = query if regex else _WHITESPACE_RUN.sub(" ", query)
     matches = _grep_text(
-        view,
-        query,
+        view.text,
+        pattern,
         location,
         regex=regex,
         max_matches=remaining,
@@ -148,8 +196,8 @@ def rendered_matches(text: str, query: str, regex: bool, filename: str, location
         raise SearchOverflowError()
     records = []
     for match in matches:
-        start = to_rendered_offset(match.char_offset, escapes)
-        end = to_rendered_offset(match.char_offset + len(match.match), escapes)
+        start = view.to_rendered(match.char_offset)
+        end = view.to_rendered(match.char_offset + len(match.match))
         records.append({
             "location": match.location,
             "match": text[start:end],

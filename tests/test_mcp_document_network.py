@@ -118,6 +118,27 @@ class TestEdgarDocumentPrincetonVCR:
             start = locator["char_offset"] - around.data["page"]["offset"]
             assert around.data["text"][start:start + len(match["match"])] == "15\\(d\\)"
 
+        # Literal queries tolerate any whitespace run (Q4 fix round 2, Gap A).
+        # Counts verified by hand from the full read text on 2026-09-29:
+        # exact-space matching finds 9 of 16 and 1 of 2.
+        net_asset_value = await edgar_document(action="search", accession_number=PRINCETON_ACCESSION,
+                                               query="net asset value", limit=50)
+        assert net_asset_value.data["page"]["total"] == 16
+        assert [m["locator"]["char_offset"] for m in net_asset_value.data["matches"]] == [
+            5970, 44095, 83745, 92297, 92489, 92578, 93750, 93941, 94030, 95355, 95864, 95998, 97667, 97711,
+            97768, 129482,
+        ]
+        assert {m["match_text"].lower() for m in net_asset_value.data["matches"]} == {"net asset value"}
+        assert "Net\nasset value" in {m["match"] for m in net_asset_value.data["matches"]}
+        section_1350 = await edgar_document(action="search", accession_number=PRINCETON_ACCESSION, document="EX-32",
+                                            query="Section 1350")
+        assert [(m["locator"]["char_offset"], m["match"]) for m in section_1350.data["matches"]] == [
+            (110, "SECTION 1350"), (221, "Section\n1350"),
+        ]
+        for match in section_1350.data["matches"]:
+            offset = match["locator"]["char_offset"]
+            assert ex32.data["text"][offset:offset + len(match["match"])] == match["match"]
+
 
 @pytest.mark.network
 @pytest.mark.vcr
