@@ -5,12 +5,24 @@ same cached text ``read`` pages -- so a locator's ``char_offset`` always
 indexes the text a follow-up read returns, and a document whose text cannot
 be read is reported in ``unsearched_documents`` rather than silently counted
 as "no matches" (QA finding P2-H1).
+
+That text is rendered markdown, which backslash-escapes punctuation
+(``Sarbanes\\-Oxley``, ``15\\(d\\)``, ``U\\.S\\.``). Matching it directly misses
+body text a reader plainly sees (Q4 review finding I1), so the query runs
+against an unescaped *view* of the rendered text. The view drops each
+escaping backslash and remembers where; a view offset ``x`` maps back to the
+rendered offset ``x + (number of dropped backslashes before x)``, which is
+exact at both ends of a match. Locators, ``match`` and ``context`` are
+therefore verbatim slices of the text ``read`` pages; ``match_text`` is the
+match as a reader sees it.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
+from bisect import bisect_left
 from typing import Any, Optional
 
 from edgar.ai.mcp.tools.continuation import fingerprint
@@ -20,6 +32,10 @@ from edgar.search.grep import _grep_text
 MAX_SEARCH_MATCHES = 1_000
 MAX_SEARCH_MATCH_CHARS = 2_048
 REGEX_TIMEOUT_SECONDS = 0.05
+CONTEXT_CHARS = 100
+# CommonMark backslash escape: a backslash before any ASCII punctuation.
+# edgar.documents' renderer escapes a subset of these outside tables.
+_MARKDOWN_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
 
 
 class SearchOverflowError(Exception):
@@ -73,9 +89,52 @@ def _unsearched(attachment, reason: str) -> dict[str, Any]:
     }
 
 
-def _document_matches(text: str, query: str, regex: bool, filename: str, location: str, remaining: int) -> list:
+def unescaped_view(text: str) -> tuple[str, list[int]]:
+    """``(view, escapes)``: ``text`` without markdown escaping backslashes.
+
+    ``escapes`` lists, in ascending order, the view index of every character
+    whose escaping backslash was dropped. ``to_rendered_offset`` uses it to
+    map a view offset back to ``text``.
+    """
+    escapes: list[int] = []
+    parts: list[str] = []
+    last = 0
+    for match in _MARKDOWN_ESCAPE.finditer(text):
+        parts.append(text[last:match.start()])
+        escapes.append(match.start() - len(escapes))
+        last = match.start() + 1  # keep the escaped character, drop the backslash
+    if not escapes:
+        return text, escapes
+    parts.append(text[last:])
+    return "".join(parts), escapes
+
+
+def to_rendered_offset(view_offset: int, escapes: list[int]) -> int:
+    """The rendered offset of a view boundary.
+
+    Every escape before ``view_offset`` adds one backslash. An escaped
+    character at ``view_offset`` itself starts at its backslash, so a match
+    beginning there includes it, and a match ending just before it excludes it.
+    """
+    return view_offset + bisect_left(escapes, view_offset)
+
+
+def _context(text: str, start: int, end: int) -> str:
+    ctx_start = max(0, start - CONTEXT_CHARS)
+    ctx_end = min(len(text), end + CONTEXT_CHARS)
+    context = text[ctx_start:ctx_end].strip()
+    if ctx_start > 0:
+        context = "..." + context
+    if ctx_end < len(text):
+        context = context + "..."
+    return context
+
+
+def rendered_matches(text: str, query: str, regex: bool, filename: str, location: str, remaining: int) -> list:
+    """Match records for one document's rendered ``text``, matched through its unescaped view."""
+    view, escapes = unescaped_view(text)
     matches = _grep_text(
-        text,
+        view,
         query,
         location,
         regex=regex,
@@ -87,15 +146,18 @@ def _document_matches(text: str, query: str, regex: bool, filename: str, locatio
     # check is a defensive guard against an unbounded result.
     if any(match.overflowed for match in matches) or len(matches) > remaining:
         raise SearchOverflowError()
-    return [
-        {
+    records = []
+    for match in matches:
+        start = to_rendered_offset(match.char_offset, escapes)
+        end = to_rendered_offset(match.char_offset + len(match.match), escapes)
+        records.append({
             "location": match.location,
-            "match": match.match,
-            "context": match.context,
-            "locator": {"document": filename, "char_offset": match.char_offset},
-        }
-        for match in matches
-    ]
+            "match": text[start:end],
+            "match_text": match.match,
+            "context": _context(text, start, end),
+            "locator": {"document": filename, "char_offset": start},
+        })
+    return records
 
 
 def _run_search(filing, attachments: list, query: str, regex: bool) -> tuple[list, list]:
@@ -108,7 +170,7 @@ def _run_search(filing, attachments: list, query: str, regex: bool) -> tuple[lis
             continue
         filename = str(attachment.document)
         remaining = max(0, MAX_SEARCH_MATCHES - len(records))
-        records.extend(_document_matches(text, query, regex, filename, _location(attachment), remaining))
+        records.extend(rendered_matches(text, query, regex, filename, _location(attachment), remaining))
     return records, unsearched
 
 

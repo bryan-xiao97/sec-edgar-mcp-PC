@@ -439,9 +439,14 @@ incorporated by reference may belong to an earlier filing; read the
 exhibit-index section or use `edgar_text_search` to find it. A BDC filing may
 report a portfolio borrower without containing that borrower's own agreement.
 
-Search never reports zero matches for text it could not read: searching an
-unreadable document (PDF, image, paper, empty) returns `unreadable_reason`, and
-an all-documents search lists skipped attachments in `unsearched_documents`.
+Search skips text it could not read and says so: searching an unreadable
+document (PDF, image, paper, empty) returns `unreadable_reason`, and an
+all-documents search lists skipped attachments in `unsearched_documents`.
+Queries match the text as a reader sees it, ignoring markdown backslash escapes
+(`15\(d\)` matches `15(d)`); `match` and `context` are verbatim slices of the
+rendered text `read` returns, and `match_text` is the unescaped match. Matching
+is case-insensitive but otherwise exact: whitespace, line breaks and table-cell
+boundaries are not normalized, so no match is not proof that a term is absent.
 `list` hides XBRL files, generated R pages and XBRL viewer files unless
 `include_all` is true. A `cursor` alone continues a list, search or read.
 `source.selected_by` is `"url"` when a URL chose the filing.

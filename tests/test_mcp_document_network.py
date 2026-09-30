@@ -87,12 +87,36 @@ class TestEdgarDocumentPrincetonVCR:
         assert "I, Mark S\\. DiSalvo, certify that:" in ex31.data["text"]
 
         # search locators index the text read returns
-        assert [(m["locator"]["document"], m["locator"]["char_offset"]) for m in searched.data["matches"]] == [
-            ("ea0301473-10q_princeton.htm", 162104), ("ea030147301ex32.htm", 168),
+        # Search matches the reader's view of the escaped markdown (Q4 fix I1).
+        # The body instance renders as "Sarbanes\\-Oxley"; the heading is unescaped.
+        # Counts were verified by hand from the full read text on 2026-09-29.
+        assert [(m["locator"]["document"], m["locator"]["char_offset"], m["match"]) for m in searched.data["matches"]] == [
+            ("ea0301473-10q_princeton.htm", 162104, "Sarbanes-Oxley"),
+            ("ea030147301ex32.htm", 168, "SARBANES-OXLEY"),
+            ("ea030147301ex32.htm", 277, "Sarbanes\\-Oxley"),
         ]
         assert searched.data["unsearched_documents"] == []
-        offset = searched.data["matches"][1]["locator"]["char_offset"]
-        assert ex32.data["text"][offset:offset + len("SARBANES-OXLEY")] == "SARBANES-OXLEY"
+        for match in searched.data["matches"][1:]:
+            offset = match["locator"]["char_offset"]
+            assert ex32.data["text"][offset:offset + len(match["match"])] == match["match"]
+        assert [m["match_text"] for m in searched.data["matches"]] == [
+            "Sarbanes-Oxley", "SARBANES-OXLEY", "Sarbanes-Oxley",
+        ]
+
+        section_15d = await edgar_document(action="search", accession_number=PRINCETON_ACCESSION, query="15(d)")
+        assert [(m["locator"]["document"], m["locator"]["char_offset"]) for m in section_15d.data["matches"]] == [
+            ("ea0301473-10q_princeton.htm", 155),
+            ("ea0301473-10q_princeton.htm", 307),
+            ("ea0301473-10q_princeton.htm", 1114),
+            ("ea0301473-10q_princeton.htm", 162747),
+            ("ea030147301ex32.htm", 738),
+        ]
+        for match in section_15d.data["matches"]:
+            assert match["match"] == "15\\(d\\)" and match["match_text"] == "15(d)"
+            locator = match["locator"]
+            around = await edgar_document(action="read", accession_number=PRINCETON_ACCESSION, around=locator)
+            start = locator["char_offset"] - around.data["page"]["offset"]
+            assert around.data["text"][start:start + len(match["match"])] == "15\\(d\\)"
 
 
 @pytest.mark.network

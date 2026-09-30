@@ -529,3 +529,102 @@ async def test_text_search_caps_per_hit_steps_at_five_unique_accessions(monkeypa
     assert accessions == [f"0000320193-23-00000{i}" for i in range(5)]
     assert "ex0.htm" in per_hit[0] and "ex1.htm" not in per_hit[0]
     assert len(response.data["results"]) == 16
+
+
+# ---------------------------------------------------------------------------
+# Q4 fix round 1 (I1): search matches the text as a reader sees it
+# ---------------------------------------------------------------------------
+
+# Exactly what edgar.documents' markdown renderer emits for body text: it
+# backslash-escapes \ ` * _ { } [ ] ( ) # + - . ! outside tables.
+_ESCAPED_BODY = (
+    "Pursuant to 18 U\\.S\\.C\\. Section 1350 and Section 13\\(a\\) or 15\\(d\\) of the Sarbanes\\-Oxley Act, "
+    "the first\\-lien loan of $1,000\\.00 under clause \\(a\\) of Form 10\\-Q; see İstanbul \\(b\\) and 15\\(d\\)\\."
+)
+
+
+def _reader_view(rendered: str) -> str:
+    import re
+
+    return re.sub(r"\\([!-/:-@\[-`{-~])", r"\1", rendered)
+
+
+@pytest.fixture
+def escaped_exhibit(filing):
+    exhibit = filing._test_attachments[2]  # agreement-a.htm, EX-10.1
+    exhibit._markdown = _ESCAPED_BODY
+    exhibit._text = "plain text that must not be searched"
+    return exhibit
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("15(d)", ["15\\(d\\)", "15\\(d\\)"]),
+        ("U.S.", ["U\\.S\\."]),
+        ("Sarbanes-Oxley", ["Sarbanes\\-Oxley"]),
+        ("first-lien", ["first\\-lien"]),
+        ("$1,000.00", ["$1,000\\.00"]),
+        ("(a)", ["\\(a\\)", "\\(a\\)"]),
+    ],
+)
+async def test_literal_search_matches_escaped_markdown_at_rendered_offsets(escaped_exhibit, query, expected):
+    searched = await _call(action="search", accession_number=ACCESSION, document="EX-10.1", query=query)
+    read = await _call(action="read", accession_number=ACCESSION, document="EX-10.1")
+
+    rendered = read.data["text"]
+    assert rendered == _ESCAPED_BODY  # read still pages the rendered markdown
+    matches = searched.data["matches"]
+    assert [m["match"] for m in matches] == expected
+    for m in matches:
+        offset = m["locator"]["char_offset"]
+        assert rendered[offset:offset + len(m["match"])] == m["match"]
+        assert m["match_text"] == query
+        assert m["match"] in m["context"] and m["context"].strip(".") in rendered
+        around = await _call(action="read", accession_number=ACCESSION, around=m["locator"])
+        assert around.data["text"][offset - around.data["page"]["offset"]:][:len(m["match"])] == m["match"]
+
+
+@pytest.mark.fast
+async def test_regex_search_matches_escaped_markdown_at_rendered_offsets(escaped_exhibit):
+    searched = await _call(
+        action="search", accession_number=ACCESSION, document="EX-10.1", query=r"15\(d\)|first-\w+", regex=True
+    )
+
+    matches = searched.data["matches"]
+    assert [(m["match_text"], m["match"]) for m in matches] == [
+        ("15(d)", "15\\(d\\)"), ("first-lien", "first\\-lien"), ("15(d)", "15\\(d\\)"),
+    ]
+    for m in matches:
+        offset = m["locator"]["char_offset"]
+        assert _ESCAPED_BODY[offset:offset + len(m["match"])] == m["match"]
+
+
+@pytest.mark.fast
+def test_unescaped_offsets_are_exact_under_unicode_fuzz():
+    import random
+
+    from edgar.ai.mcp.tools.document_search import rendered_matches, unescaped_view
+    from edgar.search.grep import _grep_text
+
+    alphabet = ["a", "b", "İ", "ı", "σ", "ς", "Σ", "e\u0307", "(", ")", "-", ".", "\\", "*", " ", "\n", "x"]
+    escape = set("\\`*_{}[]()#+-.!")
+    rng = random.Random(20260929)  # noqa: S311 -- deterministic fuzz seed, not cryptography
+    checked = 0
+    for _ in range(2_000):
+        original = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 60)))
+        rendered = "".join("\\" + ch if ch in escape else ch for ch in original)
+        assert unescaped_view(rendered)[0] == original
+        start = rng.randrange(len(original))
+        query = original[start:start + rng.randint(1, 6)]
+        oracle = _grep_text(original, query, "doc")
+        records = rendered_matches(rendered, query, False, "doc.htm", "doc", remaining=10_000)
+        assert len(records) == len(oracle)
+        for record, expected in zip(records, oracle, strict=True):
+            offset = record["locator"]["char_offset"]
+            assert rendered[offset:offset + len(record["match"])] == record["match"]
+            assert len(_reader_view(rendered[:offset])) == expected.char_offset
+            assert _reader_view(record["match"]) == expected.match == record["match_text"]
+            checked += 1
+    assert checked > 2_000
