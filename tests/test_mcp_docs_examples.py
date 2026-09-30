@@ -46,18 +46,6 @@ DOC_PATHS = (
     ROOT / "edgar/ai/mcp/docs/MCP_QUICKSTART.md",
 )
 
-# Tools whose description= uses the "Examples:\n- label: key=\"value\", ..."
-# prose style, in addition to a marked JSON block. edgar_document has no
-# such prose block (only marked JSON), so it is checked there only.
-DESCRIPTION_EXAMPLE_TOOLS = {
-    "edgar_fund",
-    "edgar_notes",
-    "edgar_read",
-    "edgar_filing",
-    "edgar_text_search",
-    "edgar_document",
-}
-
 MARKED_JSON = re.compile(
     r"<!--\s*MCP_TOOL_CALL_EXAMPLE\s*-->\s*```json\s*(.*?)\s*```",
     flags=re.DOTALL,
@@ -66,8 +54,36 @@ MARKED_JSON = re.compile(
 # One "Examples:" prose block, up to the next blank line or marked block.
 PROSE_BLOCK = re.compile(r"Examples?:\s*\n(.*?)(?:\n\s*\n|<!--|\Z)", flags=re.DOTALL)
 
-# key="value" or key=["a","b"] anywhere in a prose bullet line.
-KEY_VALUE = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\[[^\]]*\])')
+# key="value", key=["a","b"], key=true/false, or a bare key=123/12.5 number,
+# anywhere in a prose bullet line.
+KEY_VALUE = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\[[^\]]*\]|true|false|-?\d+(?:\.\d+)?)')
+
+# Tools excluded from prose-example checking, with the reason recorded here.
+# A tool is never silently dropped -- if one belongs here, say why.
+_PROSE_EXCLUDED_TOOLS: dict[str, str] = {}
+
+
+def _tools_with_prose_examples_block() -> set[str]:
+    """Every registered tool whose description has an "Examples:" block,
+    minus ``_PROSE_EXCLUDED_TOOLS``.
+
+    Derived from the live registry rather than a hardcoded allowlist, so a
+    new tool that documents this style of example is covered automatically
+    (a prior hardcoded list of 6 tools silently missed 8 others --
+    edgar_company, edgar_compare, edgar_monitor, edgar_proxy,
+    edgar_ownership, edgar_screen, edgar_trends, edgar_search -- that use
+    the identical "- label: key=\"value\"" syntax).
+    """
+    return {
+        name for name, info in TOOLS.items()
+        if name not in _PROSE_EXCLUDED_TOOLS and PROSE_BLOCK.search(info["description"])
+    }
+
+
+# Tools whose description= uses the "Examples:\n- label: key=\"value\", ..."
+# prose style, in addition to any marked JSON block. edgar_document has no
+# such prose block (only marked JSON), so it is checked there only.
+DESCRIPTION_EXAMPLE_TOOLS = _tools_with_prose_examples_block()
 
 
 # =============================================================================
@@ -100,11 +116,18 @@ def _extract_examples(source: str, content: str) -> list[dict[str, Any]]:
 
 
 def _parse_prose_value(raw: str):
-    """A quoted string or a ``["a","b"]`` list literal to a Python value."""
+    """A quoted string, a ``["a","b"]`` list literal, ``true``/``false``, or
+    a bare number (``2834``, ``5.0``), to a Python value."""
     if raw.startswith("["):
         inner = raw[1:-1]
         return [item.strip().strip('"') for item in inner.split(",") if item.strip()]
-    return raw[1:-1]
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    if raw.startswith('"'):
+        return raw[1:-1]
+    return float(raw) if "." in raw else int(raw)
 
 
 def _extract_prose_examples(tool_name: str, description: str) -> list[dict[str, Any]]:
@@ -256,10 +279,14 @@ def _check_source_examples(source: str, examples: list[dict[str, Any]]) -> None:
 def _all_examples() -> dict[str, list[dict[str, Any]]]:
     """Every marked-JSON and prose example, keyed by source label.
 
-    Only sources that document at least one example carry a key -- most
-    tools (edgar_company, edgar_search, ...) use natural-language "Example
-    prompts:" text with no parseable key="value" call, which is not a
-    tool-call example and is intentionally out of scope.
+    Only sources that document at least one example carry a key. A tool
+    without ANY parsed example (no marked JSON and no "Examples:" block at
+    all, e.g. edgar_monitor's "- All latest: (no parameters)" bullet, which
+    documents an empty call rather than a key="value" one) is intentionally
+    out of scope -- but ``DESCRIPTION_EXAMPLE_TOOLS`` is derived from the
+    registry (``_tools_with_prose_examples_block``), not hardcoded, and
+    ``test_every_tool_with_an_examples_block_yields_parsed_examples`` fails
+    if a tool that DOES have an "Examples:" block yields zero.
     """
     examples: dict[str, list[dict[str, Any]]] = {}
 
@@ -297,6 +324,32 @@ def test_documented_examples_match_registered_schemas():
     # narrowing coverage back down to a subset of tools.
     for name in DESCRIPTION_EXAMPLE_TOOLS:
         assert all_examples[f"{name} description"], f"{name}: expected documented examples"
+
+
+@pytest.mark.fast
+def test_every_tool_with_an_examples_block_yields_parsed_examples():
+    """A registered tool whose description has an "Examples:" block must
+    yield at least one parsed ``key="value"`` bullet, not zero.
+
+    ``DESCRIPTION_EXAMPLE_TOOLS`` (``_tools_with_prose_examples_block``) is
+    the set this checks -- it is derived from the live registry, so this
+    guard fires the moment a NEW tool's "Examples:" block goes unparsed
+    (a bug in the bullet syntax, or a regression in ``KEY_VALUE``/
+    ``PROSE_BLOCK``), not just when today's known set does. This is the
+    exact class of bug the fix-round finding named: a hardcoded 6-tool
+    allowlist silently missed edgar_company/edgar_compare/edgar_monitor/
+    edgar_proxy/edgar_ownership/edgar_screen/edgar_trends/edgar_search,
+    which all have a checkable "Examples:" block.
+    """
+    tools_with_examples_block = _tools_with_prose_examples_block()
+    assert tools_with_examples_block, "expected at least one tool with an Examples: block"
+
+    for name in sorted(tools_with_examples_block):
+        examples = _extract_prose_examples(name, TOOLS[name]["description"])
+        assert examples, (
+            f"{name}: has an 'Examples:' block but yielded zero parsed examples "
+            "-- check the bullet syntax against KEY_VALUE/PROSE_BLOCK"
+        )
 
 
 @pytest.mark.fast
